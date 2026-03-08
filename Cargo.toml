@@ -1,0 +1,52 @@
+[package]
+name = "engramai"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.75"
+description = "Neuroscience-grounded memory system for AI agents. ACT-R activation, Hebbian learning, Ebbinghaus forgetting, cognitive consolidation."
+authors = ["Toni Tang <tonitangpotato@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tonitangpotato/engramai"
+keywords = ["ai", "memory", "cognitive-science", "agent", "neuroscience"]
+categories = ["science", "database", "algorithms"]
+
+[dependencies]
+# Core database
+rusqlite = { version = "0.32", features = ["bundled", "uuid"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# UUID generation
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+
+# Random for interleaved replay
+rand = "0.8"
+
+[dev-dependencies]
+env_logger = "0.11"
+tempfile = "3.13"
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[lib]
+name = "engramai"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
