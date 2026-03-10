@@ -17,13 +17,13 @@ impl Storage {
     /// Use `:memory:` for an in-memory database.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
-        
+
         // Enable WAL mode for better concurrency
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        
+
         // Create schema
         Self::create_schema(&conn)?;
-        
+
         Ok(Self { conn })
     }
 
@@ -96,9 +96,12 @@ impl Storage {
     /// Add a new memory to storage.
     pub fn add(&mut self, record: &MemoryRecord) -> Result<(), rusqlite::Error> {
         let tx = self.conn.transaction()?;
-        
-        let metadata_json = record.metadata.as_ref().map(|m| serde_json::to_string(m).ok()).flatten();
-        
+
+        let metadata_json = record
+            .metadata
+            .as_ref()
+            .and_then(|m| serde_json::to_string(m).ok());
+
         tx.execute(
             r#"
             INSERT INTO memories (
@@ -126,13 +129,13 @@ impl Storage {
                 metadata_json,
             ],
         )?;
-        
+
         // Record initial access
         tx.execute(
             "INSERT INTO access_log (memory_id, accessed_at) VALUES (?, ?)",
             params![record.id, record.created_at.to_rfc3339()],
         )?;
-        
+
         tx.commit()?;
         Ok(())
     }
@@ -140,13 +143,11 @@ impl Storage {
     /// Get a memory by ID.
     pub fn get(&self, id: &str) -> Result<Option<MemoryRecord>, rusqlite::Error> {
         let access_times = self.get_access_times(id)?;
-        
+
         self.conn
-            .query_row(
-                "SELECT * FROM memories WHERE id = ?",
-                params![id],
-                |row| self.row_to_record(row, access_times.clone()),
-            )
+            .query_row("SELECT * FROM memories WHERE id = ?", params![id], |row| {
+                self.row_to_record(row, access_times.clone())
+            })
             .optional()
     }
 
@@ -158,14 +159,17 @@ impl Storage {
             let access_times = self.get_access_times(&id).unwrap_or_default();
             self.row_to_record(row, access_times)
         })?;
-        
+
         rows.collect()
     }
 
     /// Update an existing memory.
     pub fn update(&mut self, record: &MemoryRecord) -> Result<(), rusqlite::Error> {
-        let metadata_json = record.metadata.as_ref().map(|m| serde_json::to_string(m).ok()).flatten();
-        
+        let metadata_json = record
+            .metadata
+            .as_ref()
+            .and_then(|m| serde_json::to_string(m).ok());
+
         self.conn.execute(
             r#"
             UPDATE memories SET
@@ -197,7 +201,8 @@ impl Storage {
 
     /// Delete a memory by ID.
     pub fn delete(&mut self, id: &str) -> Result<(), rusqlite::Error> {
-        self.conn.execute("DELETE FROM memories WHERE id = ?", params![id])?;
+        self.conn
+            .execute("DELETE FROM memories WHERE id = ?", params![id])?;
         Ok(())
     }
 
@@ -212,36 +217,40 @@ impl Storage {
 
     /// Get all access timestamps for a memory.
     pub fn get_access_times(&self, id: &str) -> Result<Vec<DateTime<Utc>>, rusqlite::Error> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT accessed_at FROM access_log WHERE memory_id = ? ORDER BY accessed_at")?;
-        
+        let mut stmt = self.conn.prepare(
+            "SELECT accessed_at FROM access_log WHERE memory_id = ? ORDER BY accessed_at",
+        )?;
+
         let rows = stmt.query_map(params![id], |row| {
             let ts: String = row.get(0)?;
             Ok(DateTime::parse_from_rfc3339(&ts)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()))
         })?;
-        
+
         rows.collect()
     }
 
     /// Full-text search using FTS5.
-    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+    pub fn search_fts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
         // Clean query: remove FTS5 special characters and punctuation
         let cleaned: String = query
             .chars()
             .filter(|c| c.is_alphanumeric() || c.is_whitespace())
             .collect();
-        
+
         let words: Vec<&str> = cleaned.split_whitespace().collect();
         if words.is_empty() {
             return Ok(vec![]);
         }
-        
+
         // Build simple OR query for better matching
         let fts_query = words.join(" OR ");
-        
+
         let mut stmt = self.conn.prepare(
             r#"
             SELECT m.* FROM memories m
@@ -250,37 +259,40 @@ impl Storage {
             ORDER BY rank LIMIT ?
             "#,
         )?;
-        
+
         let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
             let id: String = row.get(0)?;
             let access_times = self.get_access_times(&id).unwrap_or_default();
             self.row_to_record(row, access_times)
         })?;
-        
+
         rows.collect()
     }
 
     /// Search memories by type.
-    pub fn search_by_type(&self, memory_type: MemoryType) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+    pub fn search_by_type(
+        &self,
+        memory_type: MemoryType,
+    ) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
         let mut stmt = self
             .conn
             .prepare("SELECT * FROM memories WHERE memory_type = ?")?;
-        
+
         let rows = stmt.query_map(params![memory_type.to_string()], |row| {
             let id: String = row.get(0)?;
             let access_times = self.get_access_times(&id).unwrap_or_default();
             self.row_to_record(row, access_times)
         })?;
-        
+
         rows.collect()
     }
 
     /// Get Hebbian neighbors for a memory.
     pub fn get_hebbian_neighbors(&self, memory_id: &str) -> Result<Vec<String>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare(
-            "SELECT target_id FROM hebbian_links WHERE source_id = ? AND strength > 0"
-        )?;
-        
+        let mut stmt = self
+            .conn
+            .prepare("SELECT target_id FROM hebbian_links WHERE source_id = ? AND strength > 0")?;
+
         let rows = stmt.query_map(params![memory_id], |row| row.get(0))?;
         rows.collect()
     }
@@ -293,7 +305,7 @@ impl Storage {
         threshold: i32,
     ) -> Result<bool, rusqlite::Error> {
         let (id1, id2) = if id1 < id2 { (id1, id2) } else { (id2, id1) };
-        
+
         // Check existing link
         let existing: Option<(f64, i32)> = self.conn
             .query_row(
@@ -302,7 +314,7 @@ impl Storage {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        
+
         match existing {
             Some((strength, count)) if strength > 0.0 => {
                 // Link already formed, strengthen it
@@ -359,13 +371,13 @@ impl Storage {
             "UPDATE hebbian_links SET strength = strength * ? WHERE strength > 0",
             params![factor],
         )?;
-        
+
         // Prune very weak links
         let pruned = self.conn.execute(
             "DELETE FROM hebbian_links WHERE strength > 0 AND strength < 0.1",
             [],
         )?;
-        
+
         Ok(pruned)
     }
 
@@ -379,7 +391,7 @@ impl Storage {
         let created_at_str: String = row.get(4)?;
         let last_consolidated_str: Option<String> = row.get(10)?;
         let metadata_str: Option<String> = row.get(14)?;
-        
+
         let memory_type = match memory_type_str.as_str() {
             "factual" => MemoryType::Factual,
             "episodic" => MemoryType::Episodic,
@@ -390,28 +402,27 @@ impl Storage {
             "causal" => MemoryType::Causal,
             _ => MemoryType::Factual,
         };
-        
+
         let layer = match layer_str.as_str() {
             "core" => MemoryLayer::Core,
             "working" => MemoryLayer::Working,
             "archive" => MemoryLayer::Archive,
             _ => MemoryLayer::Working,
         };
-        
+
         let created_at = DateTime::parse_from_rfc3339(&created_at_str)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
-        
+
         let last_consolidated = last_consolidated_str
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc));
-        
+
         let contradicts_str: String = row.get(12)?;
         let contradicted_by_str: String = row.get(13)?;
-        
-        let metadata = metadata_str
-            .and_then(|s| serde_json::from_str(&s).ok());
-        
+
+        let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+
         Ok(MemoryRecord {
             id: row.get(0)?,
             content: row.get(1)?,
@@ -426,8 +437,16 @@ impl Storage {
             consolidation_count: row.get(9)?,
             last_consolidated,
             source: row.get(11)?,
-            contradicts: if contradicts_str.is_empty() { None } else { Some(contradicts_str) },
-            contradicted_by: if contradicted_by_str.is_empty() { None } else { Some(contradicted_by_str) },
+            contradicts: if contradicts_str.is_empty() {
+                None
+            } else {
+                Some(contradicts_str)
+            },
+            contradicted_by: if contradicted_by_str.is_empty() {
+                None
+            } else {
+                Some(contradicted_by_str)
+            },
             metadata,
         })
     }

@@ -70,12 +70,19 @@ pub fn consolidate_single(record: &mut MemoryRecord, dt_days: f64, config: &Memo
 /// 2. Interleaved replay: also touch some archive (L4) memories
 ///    (prevents catastrophic forgetting)
 /// 3. Promote/demote memories between layers based on strength
-pub fn run_consolidation_cycle(storage: &mut Storage, dt_days: f64, config: &MemoryConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_consolidation_cycle(
+    storage: &mut Storage,
+    dt_days: f64,
+    config: &MemoryConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut all_memories = storage.all()?;
     let mut rng = rand::thread_rng();
 
     // Step 1: Consolidate all working memories
-    for record in all_memories.iter_mut().filter(|r| r.layer == MemoryLayer::Working) {
+    for record in all_memories
+        .iter_mut()
+        .filter(|r| r.layer == MemoryLayer::Working)
+    {
         consolidate_single(record, dt_days, config);
     }
 
@@ -84,11 +91,11 @@ pub fn run_consolidation_cycle(storage: &mut Storage, dt_days: f64, config: &Mem
         .iter_mut()
         .filter(|r| r.layer == MemoryLayer::Archive)
         .collect();
-    
+
     if !archive.is_empty() {
         let n_replay = ((archive.len() as f64 * config.interleave_ratio).ceil() as usize).max(1);
         archive.shuffle(&mut rng);
-        
+
         for record in archive.iter_mut().take(n_replay) {
             // Replaying an archived memory slightly boosts its core_strength
             record.core_strength += config.replay_boost * (0.5 + record.importance);
@@ -98,7 +105,10 @@ pub fn run_consolidation_cycle(storage: &mut Storage, dt_days: f64, config: &Mem
     }
 
     // Step 3: Decay core memories
-    for record in all_memories.iter_mut().filter(|r| r.layer == MemoryLayer::Core) {
+    for record in all_memories
+        .iter_mut()
+        .filter(|r| r.layer == MemoryLayer::Core)
+    {
         apply_decay(record, dt_days, 0.0, config.mu2); // No working decay for core
     }
 

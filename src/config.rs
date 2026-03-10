@@ -19,12 +19,12 @@ pub struct MemoryConfig {
     pub interleave_ratio: f64,
     /// Core strength boost per replayed archived memory (base)
     pub replay_boost: f64,
-    
+
     // Layer rebalancing thresholds
     pub promote_threshold: f64,
     pub demote_threshold: f64,
     pub archive_threshold: f64,
-    
+
     // === Activation (ACT-R) ===
     /// Base-level activation decay parameter (d in t^-d)
     pub actr_decay: f64,
@@ -34,7 +34,7 @@ pub struct MemoryConfig {
     pub importance_weight: f64,
     /// Contradiction penalty in activation
     pub contradiction_penalty: f64,
-    
+
     // === Forgetting ===
     /// Spacing effect multiplier
     pub spacing_factor: f64,
@@ -44,15 +44,15 @@ pub struct MemoryConfig {
     pub consolidation_bonus: f64,
     /// Effective strength threshold for pruning
     pub forget_threshold: f64,
-    
+
     // === Reward ===
     /// Default reward magnitude
     pub reward_magnitude: f64,
-    
+
     // === Downscaling ===
     /// Global downscaling factor per consolidation cycle
     pub downscale_factor: f64,
-    
+
     // === Hebbian learning ===
     /// Enable Hebbian link formation
     pub hebbian_enabled: bool,
@@ -60,7 +60,7 @@ pub struct MemoryConfig {
     pub hebbian_threshold: i32,
     /// Link strength decay per consolidation cycle
     pub hebbian_decay: f64,
-    
+
     // === STDP (causal inference) ===
     /// Enable temporal direction tracking
     pub stdp_enabled: bool,
@@ -68,6 +68,10 @@ pub struct MemoryConfig {
     pub stdp_causal_threshold: f64,
     /// Minimum observations before STDP inference
     pub stdp_min_observations: i32,
+
+    // === Noise filtering ===
+    /// Enable noise filtering (skip greetings, acknowledgments, etc.)
+    pub noise_filter_enabled: bool,
 }
 
 impl Default for MemoryConfig {
@@ -98,6 +102,7 @@ impl Default for MemoryConfig {
             stdp_enabled: true,
             stdp_causal_threshold: 2.0,
             stdp_min_observations: 3,
+            noise_filter_enabled: true,
         }
     }
 }

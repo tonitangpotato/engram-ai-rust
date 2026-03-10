@@ -100,34 +100,34 @@ pub struct MemoryRecord {
     pub memory_type: MemoryType,
     /// Current layer
     pub layer: MemoryLayer,
-    
+
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// All access timestamps (for ACT-R base-level activation)
     pub access_times: Vec<DateTime<Utc>>,
-    
+
     /// Working memory strength (hippocampal trace, fast decay)
     pub working_strength: f64,
     /// Core memory strength (neocortical trace, slow decay)
     pub core_strength: f64,
-    
+
     /// Importance/emotional modulation (0-1)
     pub importance: f64,
     /// Pinned memories never decay
     pub pinned: bool,
-    
+
     /// Number of consolidation cycles
     pub consolidation_count: i32,
     /// Last consolidation timestamp
     pub last_consolidated: Option<DateTime<Utc>>,
-    
+
     /// Source identifier
     pub source: String,
-    
+
     /// Contradiction links
     pub contradicts: Option<String>,
     pub contradicted_by: Option<String>,
-    
+
     /// Optional structured metadata (JSON)
     pub metadata: Option<serde_json::Value>,
 }
