@@ -180,6 +180,89 @@ enum Commands {
         #[command(subcommand)]
         action: BusAction,
     },
+    
+    // === Phase 3: Cross-Agent Intelligence ===
+    
+    /// Subscribe to namespace notifications
+    Subscribe {
+        /// Agent ID to subscribe
+        agent_id: String,
+        
+        /// Namespace to watch ("*" for all)
+        #[arg(long, short = 'n')]
+        ns: String,
+        
+        /// Minimum importance to trigger notification (0.0-1.0)
+        #[arg(long, short = 'i', default_value = "0.8")]
+        min_importance: f64,
+    },
+    
+    /// Unsubscribe from namespace notifications
+    Unsubscribe {
+        /// Agent ID to unsubscribe
+        agent_id: String,
+        
+        /// Namespace to stop watching
+        #[arg(long, short = 'n')]
+        ns: String,
+    },
+    
+    /// Check pending notifications for an agent
+    Notifications {
+        /// Agent ID to check notifications for
+        agent_id: String,
+        
+        /// Just peek without marking as read
+        #[arg(long)]
+        peek: bool,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// Discover cross-namespace associations
+    CrossLinks {
+        /// First namespace
+        #[arg(long)]
+        ns_a: String,
+        
+        /// Second namespace
+        #[arg(long)]
+        ns_b: String,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// Recall with cross-namespace associations
+    RecallAssoc {
+        /// Search query
+        query: String,
+        
+        /// Namespace to search (use "*" for all with cross-links)
+        #[arg(long, short = 'n', default_value = "*")]
+        ns: String,
+        
+        /// Maximum number of results
+        #[arg(long, short = 'l', default_value = "5")]
+        limit: usize,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// List subscriptions for an agent
+    Subscriptions {
+        /// Agent ID to list subscriptions for
+        agent_id: String,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -545,6 +628,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("  {}: {:.2}", name, s);
                             }
                         }
+                    }
+                }
+            }
+        }
+        
+        // === Phase 3: Cross-Agent Intelligence ===
+        
+        Commands::Subscribe { agent_id, ns, min_importance } => {
+            mem.subscribe(&agent_id, &ns, min_importance)?;
+            println!("Subscribed {} to namespace '{}' (min_importance: {:.2})", 
+                agent_id, ns, min_importance);
+        }
+        
+        Commands::Unsubscribe { agent_id, ns } => {
+            let removed = mem.unsubscribe(&agent_id, &ns)?;
+            if removed {
+                println!("Unsubscribed {} from namespace '{}'", agent_id, ns);
+            } else {
+                println!("No subscription found for {} on namespace '{}'", agent_id, ns);
+            }
+        }
+        
+        Commands::Notifications { agent_id, peek, json } => {
+            let notifs = if peek {
+                mem.peek_notifications(&agent_id)?
+            } else {
+                mem.check_notifications(&agent_id)?
+            };
+            
+            if json {
+                println!("{}", serde_json::to_string_pretty(&notifs)?);
+            } else {
+                if notifs.is_empty() {
+                    println!("No pending notifications for {}", agent_id);
+                } else {
+                    println!("Notifications for {} ({}):", agent_id, notifs.len());
+                    for n in &notifs {
+                        println!("  [{}:{}] ({:.2}) {}", 
+                            n.namespace, n.memory_id, n.importance, 
+                            if n.content.len() > 60 {
+                                format!("{}...", &n.content[..60])
+                            } else {
+                                n.content.clone()
+                            }
+                        );
+                    }
+                    if peek {
+                        println!("\n(peeked - not marked as read)");
+                    }
+                }
+            }
+        }
+        
+        Commands::CrossLinks { ns_a, ns_b, json } => {
+            let links = mem.discover_cross_links(&ns_a, &ns_b)?;
+            
+            if json {
+                println!("{}", serde_json::to_string_pretty(&links)?);
+            } else {
+                if links.is_empty() {
+                    println!("No cross-namespace links found between '{}' and '{}'", ns_a, ns_b);
+                } else {
+                    println!("Cross-namespace links between '{}' and '{}' ({}):", ns_a, ns_b, links.len());
+                    for link in &links {
+                        println!("  {} ↔ {} (strength: {:.2}, coactivations: {})",
+                            link.source_id, link.target_id, link.strength, link.coactivation_count);
+                    }
+                }
+            }
+        }
+        
+        Commands::RecallAssoc { query, ns, limit, json } => {
+            let ns_opt = if ns == "default" { None } else { Some(ns.as_str()) };
+            let result = mem.recall_with_associations(&query, ns_opt, limit)?;
+            
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                if result.memories.is_empty() {
+                    println!("No memories found.");
+                } else {
+                    println!("Memories ({}):", result.memories.len());
+                    for r in &result.memories {
+                        println!("  [{}] ({:.2}) {}", r.record.id, r.confidence, r.record.content);
+                    }
+                    
+                    if !result.cross_links.is_empty() {
+                        println!("\nCross-namespace associations ({}):", result.cross_links.len());
+                        for link in &result.cross_links {
+                            let desc = link.description.as_ref()
+                                .map(|d| if d.len() > 40 { format!("{}...", &d[..40]) } else { d.clone() })
+                                .unwrap_or_default();
+                            println!("  {}:{} → {}:{} ({:.2}) {}", 
+                                link.source_ns, link.source_id, 
+                                link.target_ns, link.target_id,
+                                link.strength, desc);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Commands::Subscriptions { agent_id, json } => {
+            let subs = mem.list_subscriptions(&agent_id)?;
+            
+            if json {
+                println!("{}", serde_json::to_string_pretty(&subs)?);
+            } else {
+                if subs.is_empty() {
+                    println!("No subscriptions for {}", agent_id);
+                } else {
+                    println!("Subscriptions for {} ({}):", agent_id, subs.len());
+                    for sub in &subs {
+                        println!("  {} (min_importance: {:.2}, since: {})",
+                            sub.namespace, sub.min_importance, sub.created_at.format("%Y-%m-%d %H:%M"));
                     }
                 }
             }

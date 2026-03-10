@@ -8,7 +8,9 @@ use crate::bus::EmotionalBus;
 use crate::config::MemoryConfig;
 use crate::models::{effective_strength, retrieval_activation, run_consolidation_cycle};
 use crate::storage::Storage;
-use crate::types::{AclEntry, LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, TypeStats};
+use crate::bus::{SubscriptionManager, Subscription, Notification};
+use crate::models::hebbian::{MemoryWithNamespace, record_cross_namespace_coactivation};
+use crate::types::{AclEntry, CrossLink, HebbianLink, LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult, TypeStats};
 
 /// Main interface to the Engram memory system.
 ///
@@ -676,6 +678,207 @@ impl Memory {
             pinned,
             uptime_hours,
         })
+    }
+    
+    // === Phase 3: Cross-Agent Intelligence ===
+    
+    /// Recall memories with cross-namespace associations.
+    ///
+    /// When using namespace="*", this also returns Hebbian links that span
+    /// across different namespaces, enabling cross-domain intelligence.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Natural language query
+    /// * `namespace` - Namespace to search ("*" for all)
+    /// * `limit` - Maximum number of results
+    pub fn recall_with_associations(
+        &mut self,
+        query: &str,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<RecallWithAssociationsResult, Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let ns = namespace.unwrap_or("default");
+        
+        // Get candidate memories via FTS
+        let candidates = self.storage.search_fts_ns(query, limit * 3, Some(ns))?;
+        
+        // Score each candidate with ACT-R activation
+        let mut scored: Vec<_> = candidates
+            .into_iter()
+            .map(|record| {
+                let activation = retrieval_activation(
+                    &record,
+                    &[],
+                    now,
+                    self.config.actr_decay,
+                    self.config.context_weight,
+                    self.config.importance_weight,
+                    self.config.contradiction_penalty,
+                );
+                (record, activation)
+            })
+            .filter(|(_, act)| *act > f64::NEG_INFINITY)
+            .collect();
+        
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        
+        // Take top-k
+        let results: Vec<_> = scored
+            .into_iter()
+            .take(limit)
+            .map(|(record, activation)| {
+                let confidence = self.compute_confidence(&record, activation);
+                let confidence_label = confidence_label(confidence);
+                
+                RecallResult {
+                    record,
+                    activation,
+                    confidence,
+                    confidence_label,
+                }
+            })
+            .collect();
+        
+        // Record access for all retrieved memories
+        for result in &results {
+            self.storage.record_access(&result.record.id)?;
+        }
+        
+        // Collect cross-namespace associations
+        let mut cross_links = Vec::new();
+        
+        // For wildcard namespace queries, also collect cross-namespace Hebbian neighbors
+        if ns == "*" && results.len() >= 2 {
+            // Get namespaces for all retrieved memories
+            let mut memories_with_ns: Vec<MemoryWithNamespace> = Vec::new();
+            
+            for result in &results {
+                if let Some(mem_ns) = self.storage.get_namespace(&result.record.id)? {
+                    memories_with_ns.push(MemoryWithNamespace {
+                        id: result.record.id.clone(),
+                        namespace: mem_ns,
+                    });
+                }
+            }
+            
+            // Record cross-namespace co-activation
+            if self.config.hebbian_enabled {
+                record_cross_namespace_coactivation(
+                    &mut self.storage,
+                    &memories_with_ns,
+                    self.config.hebbian_threshold,
+                )?;
+            }
+            
+            // Collect cross-links from all retrieved memories
+            for result in &results {
+                let links = self.storage.get_cross_namespace_neighbors(&result.record.id)?;
+                cross_links.extend(links);
+            }
+            
+            // Deduplicate by (source_id, target_id)
+            cross_links.sort_by(|a, b| {
+                (&a.source_id, &a.target_id).cmp(&(&b.source_id, &b.target_id))
+            });
+            cross_links.dedup_by(|a, b| a.source_id == b.source_id && a.target_id == b.target_id);
+            
+            // Sort by strength descending
+            cross_links.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap());
+        }
+        
+        Ok(RecallWithAssociationsResult {
+            memories: results,
+            cross_links,
+        })
+    }
+    
+    /// Discover cross-namespace Hebbian links between two namespaces.
+    ///
+    /// Returns all Hebbian associations that span across the given namespaces.
+    /// ACL-aware: only returns links between namespaces the agent can read.
+    pub fn discover_cross_links(
+        &self,
+        namespace_a: &str,
+        namespace_b: &str,
+    ) -> Result<Vec<HebbianLink>, Box<dyn std::error::Error>> {
+        // ACL check if agent_id is set
+        if let Some(ref agent_id) = self.agent_id {
+            let can_read_a = self.storage.check_permission(agent_id, namespace_a, Permission::Read)?;
+            let can_read_b = self.storage.check_permission(agent_id, namespace_b, Permission::Read)?;
+            
+            if !can_read_a || !can_read_b {
+                return Ok(vec![]); // No access to one or both namespaces
+            }
+        }
+        
+        Ok(self.storage.discover_cross_links(namespace_a, namespace_b)?)
+    }
+    
+    /// Get all cross-namespace associations for a memory.
+    pub fn get_cross_associations(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<CrossLink>, Box<dyn std::error::Error>> {
+        Ok(self.storage.get_cross_namespace_neighbors(memory_id)?)
+    }
+    
+    // === Subscription/Notification Methods ===
+    
+    /// Subscribe to notifications for a namespace.
+    ///
+    /// The agent will receive notifications when new memories are stored
+    /// with importance >= min_importance in the specified namespace.
+    pub fn subscribe(
+        &self,
+        agent_id: &str,
+        namespace: &str,
+        min_importance: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mgr = SubscriptionManager::new(self.storage.connection())?;
+        mgr.subscribe(agent_id, namespace, min_importance)?;
+        Ok(())
+    }
+    
+    /// Unsubscribe from a namespace.
+    pub fn unsubscribe(
+        &self,
+        agent_id: &str,
+        namespace: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let mgr = SubscriptionManager::new(self.storage.connection())?;
+        Ok(mgr.unsubscribe(agent_id, namespace)?)
+    }
+    
+    /// List subscriptions for an agent.
+    pub fn list_subscriptions(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<Subscription>, Box<dyn std::error::Error>> {
+        let mgr = SubscriptionManager::new(self.storage.connection())?;
+        Ok(mgr.list_subscriptions(agent_id)?)
+    }
+    
+    /// Check for notifications since last check.
+    ///
+    /// Returns new memories that exceed the subscription thresholds.
+    /// Updates the cursor so the same notifications aren't returned twice.
+    pub fn check_notifications(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<Notification>, Box<dyn std::error::Error>> {
+        let mgr = SubscriptionManager::new(self.storage.connection())?;
+        Ok(mgr.check_notifications(agent_id)?)
+    }
+    
+    /// Peek at notifications without updating cursor.
+    pub fn peek_notifications(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<Notification>, Box<dyn std::error::Error>> {
+        let mgr = SubscriptionManager::new(self.storage.connection())?;
+        Ok(mgr.peek_notifications(agent_id)?)
     }
 
     fn compute_confidence(&self, record: &MemoryRecord, activation: f64) -> f64 {

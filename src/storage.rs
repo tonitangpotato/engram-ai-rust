@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 
-use crate::types::{AclEntry, MemoryLayer, MemoryRecord, MemoryType, Permission};
+use crate::types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryType, Permission};
 
 /// SQLite-backed memory storage with FTS5 search.
 pub struct Storage {
@@ -813,5 +813,210 @@ impl Storage {
                 Ok(false)
             }
         }
+    }
+    
+    // === Cross-Namespace Hebbian Methods (Phase 3) ===
+    
+    /// Record cross-namespace co-activation.
+    ///
+    /// When memories from different namespaces are recalled together,
+    /// this creates a Hebbian link that spans namespaces.
+    pub fn record_cross_namespace_coactivation(
+        &mut self,
+        id1: &str,
+        ns1: &str,
+        id2: &str,
+        ns2: &str,
+        threshold: i32,
+    ) -> Result<bool, rusqlite::Error> {
+        // Only create cross-namespace links when namespaces differ
+        if ns1 == ns2 {
+            return self.record_coactivation_ns(id1, id2, threshold, ns1);
+        }
+        
+        // Ensure consistent ordering
+        let (id1, id2, ns1, ns2) = if (ns1, id1) < (ns2, id2) {
+            (id1, id2, ns1, ns2)
+        } else {
+            (id2, id1, ns2, ns1)
+        };
+        
+        // Check existing link
+        let existing: Option<(f64, i32)> = self.conn
+            .query_row(
+                "SELECT strength, coactivation_count FROM hebbian_links WHERE source_id = ? AND target_id = ?",
+                params![id1, id2],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        
+        // Use "cross" as special namespace marker for cross-namespace links
+        let cross_ns = format!("{}:{}", ns1, ns2);
+        
+        match existing {
+            Some((strength, _count)) if strength > 0.0 => {
+                // Link already formed, strengthen it
+                let new_strength = (strength + 0.1).min(1.0);
+                self.conn.execute(
+                    "UPDATE hebbian_links SET strength = ?, coactivation_count = coactivation_count + 1 WHERE source_id = ? AND target_id = ?",
+                    params![new_strength, id1, id2],
+                )?;
+                // Also update reverse link
+                self.conn.execute(
+                    "UPDATE hebbian_links SET strength = ?, coactivation_count = coactivation_count + 1 WHERE source_id = ? AND target_id = ?",
+                    params![new_strength, id2, id1],
+                )?;
+                Ok(false)
+            }
+            Some((_, count)) => {
+                // Tracking phase, increment count
+                let new_count = count + 1;
+                if new_count >= threshold {
+                    // Threshold reached, form link
+                    self.conn.execute(
+                        "UPDATE hebbian_links SET strength = 1.0, coactivation_count = ? WHERE source_id = ? AND target_id = ?",
+                        params![new_count, id1, id2],
+                    )?;
+                    // Create reverse link
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, namespace) VALUES (?, ?, 1.0, ?, ?, ?)",
+                        params![id2, id1, new_count, Utc::now().to_rfc3339(), &cross_ns],
+                    )?;
+                    Ok(true)
+                } else {
+                    self.conn.execute(
+                        "UPDATE hebbian_links SET coactivation_count = ? WHERE source_id = ? AND target_id = ?",
+                        params![new_count, id1, id2],
+                    )?;
+                    Ok(false)
+                }
+            }
+            None => {
+                // First co-activation, create tracking record
+                self.conn.execute(
+                    "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, namespace) VALUES (?, ?, 0.0, 1, ?, ?)",
+                    params![id1, id2, Utc::now().to_rfc3339(), &cross_ns],
+                )?;
+                Ok(false)
+            }
+        }
+    }
+    
+    /// Discover cross-namespace Hebbian links between two namespaces.
+    ///
+    /// Returns all Hebbian links where source is in namespace_a and target
+    /// is in namespace_b (or vice versa).
+    pub fn discover_cross_links(
+        &self,
+        namespace_a: &str,
+        namespace_b: &str,
+    ) -> Result<Vec<HebbianLink>, rusqlite::Error> {
+        // Find links with cross-namespace marker
+        let cross_ns_1 = format!("{}:{}", namespace_a, namespace_b);
+        let cross_ns_2 = format!("{}:{}", namespace_b, namespace_a);
+        
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT h.source_id, h.target_id, h.strength, h.coactivation_count, 
+                   h.direction, h.created_at, h.namespace,
+                   m1.namespace as source_ns, m2.namespace as target_ns
+            FROM hebbian_links h
+            LEFT JOIN memories m1 ON h.source_id = m1.id
+            LEFT JOIN memories m2 ON h.target_id = m2.id
+            WHERE h.strength > 0 AND (h.namespace = ? OR h.namespace = ?)
+            ORDER BY h.strength DESC
+            "#,
+        )?;
+        
+        let rows = stmt.query_map(params![cross_ns_1, cross_ns_2], |row| {
+            let created_at_str: String = row.get(5)?;
+            let source_ns: Option<String> = row.get(7)?;
+            let target_ns: Option<String> = row.get(8)?;
+            
+            Ok(HebbianLink {
+                source_id: row.get(0)?,
+                target_id: row.get(1)?,
+                strength: row.get(2)?,
+                coactivation_count: row.get(3)?,
+                direction: row.get(4)?,
+                created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                source_ns,
+                target_ns,
+            })
+        })?;
+        
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+    
+    /// Get all cross-namespace links for a memory.
+    pub fn get_cross_namespace_neighbors(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<CrossLink>, rusqlite::Error> {
+        // Get source memory's namespace
+        let source_ns = self.get_namespace(memory_id)?;
+        
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT h.source_id, h.target_id, h.strength, m.namespace, m.content
+            FROM hebbian_links h
+            JOIN memories m ON h.target_id = m.id
+            WHERE h.source_id = ? AND h.strength > 0
+            "#,
+        )?;
+        
+        let source_ns_str = source_ns.clone().unwrap_or_else(|| "default".to_string());
+        
+        let rows = stmt.query_map(params![memory_id], |row| {
+            let target_ns: String = row.get(3)?;
+            let content: String = row.get(4)?;
+            
+            Ok(CrossLink {
+                source_id: row.get(0)?,
+                source_ns: source_ns_str.clone(),
+                target_id: row.get(1)?,
+                target_ns,
+                strength: row.get(2)?,
+                description: Some(content),
+            })
+        })?;
+        
+        // Filter to only cross-namespace links
+        let source_ns_val = source_ns.unwrap_or_else(|| "default".to_string());
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter(|link| link.target_ns != source_ns_val)
+            .collect())
+    }
+    
+    /// Get all cross-namespace links in the database.
+    pub fn get_all_cross_links(&self) -> Result<Vec<CrossLink>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT h.source_id, h.target_id, h.strength, 
+                   m1.namespace as source_ns, m2.namespace as target_ns,
+                   m2.content as target_content
+            FROM hebbian_links h
+            JOIN memories m1 ON h.source_id = m1.id
+            JOIN memories m2 ON h.target_id = m2.id
+            WHERE h.strength > 0 AND m1.namespace != m2.namespace
+            ORDER BY h.strength DESC
+            "#,
+        )?;
+        
+        let rows = stmt.query_map([], |row| {
+            Ok(CrossLink {
+                source_id: row.get(0)?,
+                target_id: row.get(1)?,
+                strength: row.get(2)?,
+                source_ns: row.get(3)?,
+                target_ns: row.get(4)?,
+                description: row.get(5)?,
+            })
+        })?;
+        
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 }

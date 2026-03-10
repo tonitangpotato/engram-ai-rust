@@ -245,3 +245,50 @@ pub struct LayerStats {
     pub avg_working: f64,
     pub avg_core: f64,
 }
+
+/// A Hebbian link between memories from different namespaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossLink {
+    /// Source memory ID
+    pub source_id: String,
+    /// Source namespace
+    pub source_ns: String,
+    /// Target memory ID
+    pub target_id: String,
+    /// Target namespace
+    pub target_ns: String,
+    /// Link strength (0.0-1.0)
+    pub strength: f64,
+    /// Optional description or context
+    pub description: Option<String>,
+}
+
+/// A Hebbian link entry from the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HebbianLink {
+    /// Source memory ID
+    pub source_id: String,
+    /// Target memory ID
+    pub target_id: String,
+    /// Link strength
+    pub strength: f64,
+    /// Number of co-activations
+    pub coactivation_count: i32,
+    /// Link direction
+    pub direction: String,
+    /// When the link was created
+    pub created_at: DateTime<Utc>,
+    /// Source memory namespace (if known)
+    pub source_ns: Option<String>,
+    /// Target memory namespace (if known)
+    pub target_ns: Option<String>,
+}
+
+/// Result of recall with associations.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallWithAssociationsResult {
+    /// Main recall results
+    pub memories: Vec<RecallResult>,
+    /// Cross-namespace associations found
+    pub cross_links: Vec<CrossLink>,
+}

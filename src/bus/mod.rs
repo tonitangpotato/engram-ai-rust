@@ -12,6 +12,7 @@ pub mod accumulator;
 pub mod alignment;
 pub mod feedback;
 pub mod mod_io;
+pub mod subscriptions;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ pub use accumulator::{EmotionalAccumulator, EmotionalTrend, NEGATIVE_THRESHOLD, 
 pub use alignment::{score_alignment, calculate_importance_boost, find_aligned_drives, ALIGNMENT_BOOST};
 pub use feedback::{BehaviorFeedback, ActionStats, BehaviorLog, LOW_SCORE_THRESHOLD, MIN_ATTEMPTS_FOR_SUGGESTION};
 pub use mod_io::{Drive, HeartbeatTask, Identity};
+pub use subscriptions::{SubscriptionManager, Subscription, Notification};
 
 /// A suggested update to SOUL.md based on emotional trends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
