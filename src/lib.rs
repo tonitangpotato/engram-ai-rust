@@ -65,4 +65,4 @@ pub mod types;
 
 pub use config::MemoryConfig;
 pub use memory::Memory;
-pub use types::{MemoryLayer, MemoryRecord, MemoryStats, MemoryType, RecallResult};
+pub use types::{AclEntry, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult};

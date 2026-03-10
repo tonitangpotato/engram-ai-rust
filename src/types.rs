@@ -3,6 +3,74 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
+
+/// Access control permission levels for multi-agent memory sharing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    /// Read access: can recall memories from this namespace
+    Read,
+    /// Write access: can store memories to this namespace
+    Write,
+    /// Admin access: full control (read + write + grant/revoke)
+    Admin,
+}
+
+impl Permission {
+    /// Check if this permission includes read access.
+    pub fn can_read(&self) -> bool {
+        matches!(self, Permission::Read | Permission::Write | Permission::Admin)
+    }
+
+    /// Check if this permission includes write access.
+    pub fn can_write(&self) -> bool {
+        matches!(self, Permission::Write | Permission::Admin)
+    }
+
+    /// Check if this permission includes admin access.
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Permission::Admin)
+    }
+}
+
+impl fmt::Display for Permission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Permission::Read => write!(f, "read"),
+            Permission::Write => write!(f, "write"),
+            Permission::Admin => write!(f, "admin"),
+        }
+    }
+}
+
+impl FromStr for Permission {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "read" => Ok(Permission::Read),
+            "write" => Ok(Permission::Write),
+            "admin" => Ok(Permission::Admin),
+            _ => Err(format!("unknown permission: {}", s)),
+        }
+    }
+}
+
+/// Access control list entry for namespace permissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclEntry {
+    /// Agent ID that has this permission
+    pub agent_id: String,
+    /// Namespace this permission applies to ("*" = all namespaces)
+    pub namespace: String,
+    /// Permission level
+    pub permission: Permission,
+    /// Agent ID that granted this permission
+    pub granted_by: String,
+    /// When this permission was granted
+    pub created_at: DateTime<Utc>,
+}
 
 /// Memory type classification following neuroscience categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,7 +214,7 @@ impl MemoryRecord {
 }
 
 /// Search result with activation score and confidence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecallResult {
     pub record: MemoryRecord,
     pub activation: f64,

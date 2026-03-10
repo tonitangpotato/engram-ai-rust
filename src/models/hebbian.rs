@@ -18,6 +18,20 @@ pub fn record_coactivation(
     memory_ids: &[String],
     threshold: i32,
 ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    record_coactivation_ns(storage, memory_ids, threshold, "default")
+}
+
+/// Record co-activation for a set of memory IDs with namespace tracking.
+///
+/// When multiple memories are retrieved together (e.g., in a single recall),
+/// each pair gets their coactivation_count incremented. When the count
+/// reaches the threshold, a Hebbian link is automatically formed.
+pub fn record_coactivation_ns(
+    storage: &mut Storage,
+    memory_ids: &[String],
+    threshold: i32,
+    namespace: &str,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
     if memory_ids.len() < 2 {
         return Ok(vec![]);
     }
@@ -30,7 +44,7 @@ pub fn record_coactivation(
             let id1 = &memory_ids[i];
             let id2 = &memory_ids[j];
 
-            let formed = storage.record_coactivation(id1, id2, threshold)?;
+            let formed = storage.record_coactivation_ns(id1, id2, threshold, namespace)?;
             if formed {
                 new_links.push((id1.clone(), id2.clone()));
             }

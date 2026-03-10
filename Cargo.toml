@@ -34,6 +34,9 @@ log = "0.4"
 # Random for interleaved replay
 rand = "0.8"
 
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
 [dev-dependencies]
 env_logger = "0.11"
 tempfile = "3.13"
@@ -45,6 +48,10 @@ path = "examples/basic_usage.rs"
 [lib]
 name = "engramai"
 path = "src/lib.rs"
+
+[[bin]]
+name = "engram"
+path = "src/main.rs"
 
 [profile.release]
 opt-level = 3

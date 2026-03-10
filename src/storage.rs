@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 
-use crate::types::{MemoryLayer, MemoryRecord, MemoryType};
+use crate::types::{AclEntry, MemoryLayer, MemoryRecord, MemoryType, Permission};
 
 /// SQLite-backed memory storage with FTS5 search.
 pub struct Storage {
@@ -23,6 +23,9 @@ impl Storage {
         
         // Create schema
         Self::create_schema(&conn)?;
+        
+        // Run migrations for v2 features (namespace, ACL)
+        Self::migrate_v2(&conn)?;
         
         Ok(Self { conn })
     }
@@ -45,7 +48,8 @@ impl Storage {
                 source TEXT DEFAULT '',
                 contradicts TEXT DEFAULT '',
                 contradicted_by TEXT DEFAULT '',
-                metadata TEXT
+                metadata TEXT,
+                namespace TEXT NOT NULL DEFAULT 'default'
             );
 
             CREATE TABLE IF NOT EXISTS access_log (
@@ -62,13 +66,25 @@ impl Storage {
                 temporal_backward INTEGER NOT NULL DEFAULT 0,
                 direction TEXT NOT NULL DEFAULT 'bidirectional',
                 created_at TEXT NOT NULL,
+                namespace TEXT NOT NULL DEFAULT 'default',
                 PRIMARY KEY (source_id, target_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS engram_acl (
+                agent_id TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                permission TEXT NOT NULL,
+                granted_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, namespace)
             );
 
             CREATE INDEX IF NOT EXISTS idx_access_log_mid ON access_log(memory_id);
             CREATE INDEX IF NOT EXISTS idx_hebbian_source ON hebbian_links(source_id);
             CREATE INDEX IF NOT EXISTS idx_hebbian_target ON hebbian_links(target_id);
             CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
+            CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
+            CREATE INDEX IF NOT EXISTS idx_hebbian_namespace ON hebbian_links(namespace);
 
             -- FTS5 for full-text search
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -92,9 +108,64 @@ impl Storage {
         )?;
         Ok(())
     }
+    
+    /// Migrate existing databases to v2 schema (add namespace, ACL table).
+    fn migrate_v2(conn: &Connection) -> SqlResult<()> {
+        // Check if namespace column exists in memories table
+        let has_namespace: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('memories') WHERE name='namespace'",
+            [],
+            |row| row.get(0),
+        )?;
+        
+        if !has_namespace {
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace)",
+                [],
+            )?;
+        }
+        
+        // Check if namespace column exists in hebbian_links table
+        let has_hebbian_namespace: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('hebbian_links') WHERE name='namespace'",
+            [],
+            |row| row.get(0),
+        )?;
+        
+        if !has_hebbian_namespace {
+            conn.execute(
+                "ALTER TABLE hebbian_links ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hebbian_namespace ON hebbian_links(namespace)",
+                [],
+            )?;
+        }
+        
+        // Create ACL table if not exists (idempotent)
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS engram_acl (
+                agent_id TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                permission TEXT NOT NULL,
+                granted_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, namespace)
+            );
+            "#,
+        )?;
+        
+        Ok(())
+    }
 
     /// Add a new memory to storage.
-    pub fn add(&mut self, record: &MemoryRecord) -> Result<(), rusqlite::Error> {
+    pub fn add(&mut self, record: &MemoryRecord, namespace: &str) -> Result<(), rusqlite::Error> {
         let tx = self.conn.transaction()?;
         
         let metadata_json = record.metadata.as_ref().map(|m| serde_json::to_string(m).ok()).flatten();
@@ -105,8 +176,8 @@ impl Storage {
                 id, content, memory_type, layer, created_at,
                 working_strength, core_strength, importance, pinned,
                 consolidation_count, last_consolidated, source,
-                contradicts, contradicted_by, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                contradicts, contradicted_by, metadata, namespace
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 record.id,
@@ -124,6 +195,7 @@ impl Storage {
                 record.contradicts.as_ref().unwrap_or(&String::new()),
                 record.contradicted_by.as_ref().unwrap_or(&String::new()),
                 metadata_json,
+                namespace,
             ],
         )?;
         
@@ -430,5 +502,311 @@ impl Storage {
             contradicted_by: if contradicted_by_str.is_empty() { None } else { Some(contradicted_by_str) },
             metadata,
         })
+    }
+    
+    /// Get the namespace of a memory by ID.
+    pub fn get_namespace(&self, id: &str) -> Result<Option<String>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT namespace FROM memories WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+    
+    /// Full-text search using FTS5, filtered by namespace.
+    /// 
+    /// If namespace is None, search in "default" namespace.
+    /// If namespace is Some("*"), search across all namespaces.
+    pub fn search_fts_ns(
+        &self,
+        query: &str,
+        limit: usize,
+        namespace: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+        // Clean query: remove FTS5 special characters and punctuation
+        let cleaned: String = query
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect();
+        
+        let words: Vec<&str> = cleaned.split_whitespace().collect();
+        if words.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        // Build simple OR query for better matching
+        let fts_query = words.join(" OR ");
+        
+        let ns = namespace.unwrap_or("default");
+        
+        if ns == "*" {
+            // Search all namespaces
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT m.* FROM memories m
+                JOIN memories_fts f ON m.rowid = f.rowid
+                WHERE memories_fts MATCH ?
+                ORDER BY rank LIMIT ?
+                "#,
+            )?;
+            
+            let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+                let id: String = row.get(0)?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                self.row_to_record(row, access_times)
+            })?;
+            
+            rows.collect()
+        } else {
+            // Search specific namespace
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT m.* FROM memories m
+                JOIN memories_fts f ON m.rowid = f.rowid
+                WHERE memories_fts MATCH ? AND m.namespace = ?
+                ORDER BY rank LIMIT ?
+                "#,
+            )?;
+            
+            let rows = stmt.query_map(params![fts_query, ns, limit as i64], |row| {
+                let id: String = row.get(0)?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                self.row_to_record(row, access_times)
+            })?;
+            
+            rows.collect()
+        }
+    }
+    
+    /// Get all memories in a specific namespace.
+    pub fn all_in_namespace(&self, namespace: Option<&str>) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+        let ns = namespace.unwrap_or("default");
+        
+        if ns == "*" {
+            return self.all();
+        }
+        
+        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE namespace = ?")?;
+        let rows = stmt.query_map(params![ns], |row| {
+            let id: String = row.get(0)?;
+            let access_times = self.get_access_times(&id).unwrap_or_default();
+            self.row_to_record(row, access_times)
+        })?;
+        
+        rows.collect()
+    }
+    
+    // === ACL Methods ===
+    
+    /// Grant a permission to an agent for a namespace.
+    pub fn grant_permission(
+        &mut self,
+        agent_id: &str,
+        namespace: &str,
+        permission: Permission,
+        granted_by: &str,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            r#"
+            INSERT OR REPLACE INTO engram_acl (agent_id, namespace, permission, granted_by, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+            params![
+                agent_id,
+                namespace,
+                permission.to_string(),
+                granted_by,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+    
+    /// Revoke a permission from an agent for a namespace.
+    pub fn revoke_permission(&mut self, agent_id: &str, namespace: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM engram_acl WHERE agent_id = ? AND namespace = ?",
+            params![agent_id, namespace],
+        )?;
+        Ok(())
+    }
+    
+    /// Check if an agent has a specific permission for a namespace.
+    /// 
+    /// Permission hierarchy: admin > write > read
+    /// Wildcard namespace ("*") grants access to all namespaces.
+    pub fn check_permission(
+        &self,
+        agent_id: &str,
+        namespace: &str,
+        required: Permission,
+    ) -> Result<bool, rusqlite::Error> {
+        // Check for direct namespace permission
+        let direct: Option<String> = self.conn
+            .query_row(
+                "SELECT permission FROM engram_acl WHERE agent_id = ? AND namespace = ?",
+                params![agent_id, namespace],
+                |row| row.get(0),
+            )
+            .optional()?;
+        
+        if let Some(perm_str) = direct {
+            if let Ok(perm) = perm_str.parse::<Permission>() {
+                return Ok(Self::permission_allows(perm, required));
+            }
+        }
+        
+        // Check for wildcard namespace permission
+        let wildcard: Option<String> = self.conn
+            .query_row(
+                "SELECT permission FROM engram_acl WHERE agent_id = ? AND namespace = '*'",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        
+        if let Some(perm_str) = wildcard {
+            if let Ok(perm) = perm_str.parse::<Permission>() {
+                return Ok(Self::permission_allows(perm, required));
+            }
+        }
+        
+        // Default: check if this is the agent's own namespace or global namespace
+        // Global namespace ("global") is readable by everyone
+        if namespace == "global" && matches!(required, Permission::Read) {
+            return Ok(true);
+        }
+        
+        // Default write to own namespace
+        if namespace == agent_id && matches!(required, Permission::Write | Permission::Read) {
+            return Ok(true);
+        }
+        
+        Ok(false)
+    }
+    
+    /// Check if granted permission allows required permission.
+    fn permission_allows(granted: Permission, required: Permission) -> bool {
+        match required {
+            Permission::Read => granted.can_read(),
+            Permission::Write => granted.can_write(),
+            Permission::Admin => granted.is_admin(),
+        }
+    }
+    
+    /// List all permissions for an agent.
+    pub fn list_permissions(&self, agent_id: &str) -> Result<Vec<AclEntry>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_id, namespace, permission, granted_by, created_at FROM engram_acl WHERE agent_id = ?"
+        )?;
+        
+        let rows = stmt.query_map(params![agent_id], |row| {
+            let perm_str: String = row.get(2)?;
+            let created_at_str: String = row.get(4)?;
+            
+            Ok(AclEntry {
+                agent_id: row.get(0)?,
+                namespace: row.get(1)?,
+                permission: perm_str.parse().unwrap_or(Permission::Read),
+                granted_by: row.get(3)?,
+                created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        
+        rows.collect()
+    }
+    
+    /// Get Hebbian neighbors for a memory, optionally filtered by namespace.
+    pub fn get_hebbian_neighbors_ns(
+        &self,
+        memory_id: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        match namespace {
+            Some("*") | None => {
+                // All namespaces (original behavior)
+                self.get_hebbian_neighbors(memory_id)
+            }
+            Some(ns) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT target_id FROM hebbian_links WHERE source_id = ? AND strength > 0 AND namespace = ?"
+                )?;
+                
+                let rows = stmt.query_map(params![memory_id, ns], |row| row.get(0))?;
+                rows.collect()
+            }
+        }
+    }
+    
+    /// Record co-activation with namespace tracking.
+    pub fn record_coactivation_ns(
+        &mut self,
+        id1: &str,
+        id2: &str,
+        threshold: i32,
+        namespace: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let (id1, id2) = if id1 < id2 { (id1, id2) } else { (id2, id1) };
+        
+        // Check existing link
+        let existing: Option<(f64, i32)> = self.conn
+            .query_row(
+                "SELECT strength, coactivation_count FROM hebbian_links WHERE source_id = ? AND target_id = ?",
+                params![id1, id2],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        
+        match existing {
+            Some((strength, count)) if strength > 0.0 => {
+                // Link already formed, strengthen it
+                let new_strength = (strength + 0.1).min(1.0);
+                self.conn.execute(
+                    "UPDATE hebbian_links SET strength = ?, coactivation_count = coactivation_count + 1 WHERE source_id = ? AND target_id = ?",
+                    params![new_strength, id1, id2],
+                )?;
+                // Also update reverse link
+                self.conn.execute(
+                    "UPDATE hebbian_links SET strength = ?, coactivation_count = coactivation_count + 1 WHERE source_id = ? AND target_id = ?",
+                    params![new_strength, id2, id1],
+                )?;
+                Ok(false)
+            }
+            Some((_, count)) => {
+                // Tracking phase, increment count
+                let new_count = count + 1;
+                if new_count >= threshold {
+                    // Threshold reached, form link
+                    self.conn.execute(
+                        "UPDATE hebbian_links SET strength = 1.0, coactivation_count = ? WHERE source_id = ? AND target_id = ?",
+                        params![new_count, id1, id2],
+                    )?;
+                    // Create reverse link
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, namespace) VALUES (?, ?, 1.0, ?, ?, ?)",
+                        params![id2, id1, new_count, Utc::now().to_rfc3339(), namespace],
+                    )?;
+                    Ok(true)
+                } else {
+                    self.conn.execute(
+                        "UPDATE hebbian_links SET coactivation_count = ? WHERE source_id = ? AND target_id = ?",
+                        params![new_count, id1, id2],
+                    )?;
+                    Ok(false)
+                }
+            }
+            None => {
+                // First co-activation, create tracking record
+                self.conn.execute(
+                    "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, namespace) VALUES (?, ?, 0.0, 1, ?, ?)",
+                    params![id1, id2, Utc::now().to_rfc3339(), namespace],
+                )?;
+                Ok(false)
+            }
+        }
     }
 }

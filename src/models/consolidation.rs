@@ -70,8 +70,20 @@ pub fn consolidate_single(record: &mut MemoryRecord, dt_days: f64, config: &Memo
 /// 2. Interleaved replay: also touch some archive (L4) memories
 ///    (prevents catastrophic forgetting)
 /// 3. Promote/demote memories between layers based on strength
-pub fn run_consolidation_cycle(storage: &mut Storage, dt_days: f64, config: &MemoryConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut all_memories = storage.all()?;
+///
+/// # Arguments
+///
+/// * `storage` - The storage backend
+/// * `dt_days` - Time step in days
+/// * `config` - Memory configuration
+/// * `namespace` - Optional namespace filter (None = all namespaces, Some("*") = all, Some("ns") = specific)
+pub fn run_consolidation_cycle(
+    storage: &mut Storage,
+    dt_days: f64,
+    config: &MemoryConfig,
+    namespace: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut all_memories = storage.all_in_namespace(namespace)?;
     let mut rng = rand::thread_rng();
 
     // Step 1: Consolidate all working memories

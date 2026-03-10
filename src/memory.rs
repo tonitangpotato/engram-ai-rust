@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::config::MemoryConfig;
 use crate::models::{effective_strength, retrieval_activation, run_consolidation_cycle};
 use crate::storage::Storage;
-use crate::types::{LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, RecallResult, TypeStats};
+use crate::types::{AclEntry, LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, TypeStats};
 
 /// Main interface to the Engram memory system.
 ///
@@ -17,6 +17,8 @@ pub struct Memory {
     storage: Storage,
     config: MemoryConfig,
     created_at: chrono::DateTime<Utc>,
+    /// Agent ID for this memory instance (used for ACL checks)
+    agent_id: Option<String>,
 }
 
 impl Memory {
@@ -36,7 +38,21 @@ impl Memory {
             storage,
             config,
             created_at,
+            agent_id: None,
         })
+    }
+    
+    /// Set the agent ID for this memory instance.
+    /// 
+    /// This is used for ACL checks when storing and recalling memories.
+    /// Each agent should identify itself before performing operations.
+    pub fn set_agent_id(&mut self, id: &str) {
+        self.agent_id = Some(id.to_string());
+    }
+    
+    /// Get the current agent ID.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
     }
 
     /// Store a new memory. Returns memory ID.
@@ -60,6 +76,29 @@ impl Memory {
         source: Option<&str>,
         metadata: Option<serde_json::Value>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        self.add_to_namespace(content, memory_type, importance, source, metadata, None)
+    }
+    
+    /// Store a new memory in a specific namespace. Returns memory ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The memory content (natural language)
+    /// * `memory_type` - Memory type classification
+    /// * `importance` - 0-1 importance score (None = auto from type)
+    /// * `source` - Source identifier (e.g., filename, conversation ID)
+    /// * `metadata` - Optional structured metadata (e.g., for causal memories)
+    /// * `namespace` - Namespace to store in (None = "default")
+    pub fn add_to_namespace(
+        &mut self,
+        content: &str,
+        memory_type: MemoryType,
+        importance: Option<f64>,
+        source: Option<&str>,
+        metadata: Option<serde_json::Value>,
+        namespace: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let ns = namespace.unwrap_or("default");
         let id = format!("{}", Uuid::new_v4())[..8].to_string();
         let importance = importance.unwrap_or_else(|| memory_type.default_importance());
 
@@ -82,7 +121,7 @@ impl Memory {
             metadata,
         };
 
-        self.storage.add(&record)?;
+        self.storage.add(&record, ns)?;
         Ok(id)
     }
 
@@ -109,12 +148,33 @@ impl Memory {
         context: Option<Vec<String>>,
         min_confidence: Option<f64>,
     ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
+        self.recall_from_namespace(query, limit, context, min_confidence, None)
+    }
+    
+    /// Retrieve relevant memories from a specific namespace.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Natural language query
+    /// * `limit` - Maximum number of results
+    /// * `context` - Additional context keywords to boost relevant memories
+    /// * `min_confidence` - Minimum confidence threshold (0-1)
+    /// * `namespace` - Namespace to search (None = "default", Some("*") = all namespaces)
+    pub fn recall_from_namespace(
+        &mut self,
+        query: &str,
+        limit: usize,
+        context: Option<Vec<String>>,
+        min_confidence: Option<f64>,
+        namespace: Option<&str>,
+    ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
         let now = Utc::now();
         let context = context.unwrap_or_default();
         let min_conf = min_confidence.unwrap_or(0.0);
+        let ns = namespace.unwrap_or("default");
 
-        // Get candidate memories via FTS
-        let candidates = self.storage.search_fts(query, limit * 3)?;
+        // Get candidate memories via FTS (namespace-aware)
+        let candidates = self.storage.search_fts_ns(query, limit * 3, Some(ns))?;
 
         // Score each candidate with ACT-R activation
         let mut scored: Vec<_> = candidates
@@ -160,13 +220,14 @@ impl Memory {
             self.storage.record_access(&result.record.id)?;
         }
 
-        // Hebbian learning: record co-activation
+        // Hebbian learning: record co-activation (namespace-aware)
         if self.config.hebbian_enabled && results.len() >= 2 {
             let memory_ids: Vec<_> = results.iter().map(|r| r.record.id.clone()).collect();
-            crate::models::record_coactivation(
+            crate::models::record_coactivation_ns(
                 &mut self.storage,
                 &memory_ids,
                 self.config.hebbian_threshold,
+                ns,
             )?;
         }
 
@@ -190,7 +251,21 @@ impl Memory {
     ///
     /// * `days` - Simulated time step in days (1.0 = one day of consolidation)
     pub fn consolidate(&mut self, days: f64) -> Result<(), Box<dyn std::error::Error>> {
-        run_consolidation_cycle(&mut self.storage, days, &self.config)?;
+        self.consolidate_namespace(days, None)
+    }
+    
+    /// Run a consolidation cycle for a specific namespace.
+    ///
+    /// # Arguments
+    ///
+    /// * `days` - Simulated time step in days (1.0 = one day of consolidation)
+    /// * `namespace` - Namespace to consolidate (None = all namespaces)
+    pub fn consolidate_namespace(
+        &mut self,
+        days: f64,
+        namespace: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        run_consolidation_cycle(&mut self.storage, days, &self.config, namespace)?;
 
         // Decay Hebbian links
         if self.config.hebbian_enabled {
@@ -384,6 +459,127 @@ impl Memory {
     /// Get Hebbian links for a specific memory.
     pub fn hebbian_links(&self, memory_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         Ok(self.storage.get_hebbian_neighbors(memory_id)?)
+    }
+    
+    /// Get Hebbian links for a specific memory, filtered by namespace.
+    pub fn hebbian_links_ns(
+        &self,
+        memory_id: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(self.storage.get_hebbian_neighbors_ns(memory_id, namespace)?)
+    }
+    
+    // === ACL Methods ===
+    
+    /// Grant a permission to an agent for a namespace.
+    /// 
+    /// Only agents with admin permission on the namespace (or wildcard admin)
+    /// can grant permissions. If no agent_id is set, uses "system" as grantor.
+    pub fn grant(
+        &mut self,
+        agent_id: &str,
+        namespace: &str,
+        permission: Permission,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let grantor = self.agent_id.clone().unwrap_or_else(|| "system".to_string());
+        self.storage.grant_permission(agent_id, namespace, permission, &grantor)?;
+        Ok(())
+    }
+    
+    /// Revoke a permission from an agent for a namespace.
+    pub fn revoke(&mut self, agent_id: &str, namespace: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.storage.revoke_permission(agent_id, namespace)?;
+        Ok(())
+    }
+    
+    /// Check if an agent has a specific permission for a namespace.
+    pub fn check_permission(
+        &self,
+        agent_id: &str,
+        namespace: &str,
+        permission: Permission,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(self.storage.check_permission(agent_id, namespace, permission)?)
+    }
+    
+    /// List all permissions for an agent.
+    pub fn list_permissions(&self, agent_id: &str) -> Result<Vec<AclEntry>, Box<dyn std::error::Error>> {
+        Ok(self.storage.list_permissions(agent_id)?)
+    }
+    
+    /// Get statistics for a specific namespace.
+    pub fn stats_ns(&self, namespace: Option<&str>) -> Result<MemoryStats, Box<dyn std::error::Error>> {
+        let all = self.storage.all_in_namespace(namespace)?;
+        let now = Utc::now();
+
+        let mut by_type: HashMap<String, Vec<&MemoryRecord>> = HashMap::new();
+        let mut by_layer: HashMap<String, Vec<&MemoryRecord>> = HashMap::new();
+        let mut pinned = 0;
+
+        for record in &all {
+            by_type
+                .entry(record.memory_type.to_string())
+                .or_default()
+                .push(record);
+            by_layer
+                .entry(record.layer.to_string())
+                .or_default()
+                .push(record);
+            if record.pinned {
+                pinned += 1;
+            }
+        }
+
+        let type_stats: HashMap<String, TypeStats> = by_type
+            .into_iter()
+            .map(|(type_name, records)| {
+                let count = records.len();
+                let avg_strength = records
+                    .iter()
+                    .map(|r| effective_strength(r, now))
+                    .sum::<f64>()
+                    / count as f64;
+                let avg_importance = records.iter().map(|r| r.importance).sum::<f64>() / count as f64;
+
+                (
+                    type_name,
+                    TypeStats {
+                        count,
+                        avg_strength,
+                        avg_importance,
+                    },
+                )
+            })
+            .collect();
+
+        let layer_stats: HashMap<String, LayerStats> = by_layer
+            .into_iter()
+            .map(|(layer_name, records)| {
+                let count = records.len();
+                let avg_working = records.iter().map(|r| r.working_strength).sum::<f64>() / count as f64;
+                let avg_core = records.iter().map(|r| r.core_strength).sum::<f64>() / count as f64;
+
+                (
+                    layer_name,
+                    LayerStats {
+                        count,
+                        avg_working,
+                        avg_core,
+                    },
+                )
+            })
+            .collect();
+
+        let uptime_hours = (now - self.created_at).num_seconds() as f64 / 3600.0;
+
+        Ok(MemoryStats {
+            total_memories: all.len(),
+            by_type: type_stats,
+            by_layer: layer_stats,
+            pinned,
+            uptime_hours,
+        })
     }
 
     fn compute_confidence(&self, record: &MemoryRecord, activation: f64) -> f64 {
