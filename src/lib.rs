@@ -60,9 +60,11 @@
 pub mod config;
 pub mod memory;
 pub mod models;
+pub mod retrieval;
 pub mod storage;
 pub mod types;
 
 pub use config::MemoryConfig;
 pub use memory::Memory;
+pub use retrieval::RetrievalConfig;
 pub use types::{MemoryLayer, MemoryRecord, MemoryStats, MemoryType, RecallResult};

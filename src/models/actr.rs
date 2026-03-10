@@ -48,7 +48,11 @@ pub fn base_level_activation(record: &MemoryRecord, now: DateTime<Utc>, decay: f
 /// and memory chunks. Here we use keyword overlap as a proxy.
 ///
 /// Σ(W_j · S_ji) ≈ weight × (overlap / total_keywords)
-pub fn spreading_activation(record: &MemoryRecord, context_keywords: &[String], weight: f64) -> f64 {
+pub fn spreading_activation(
+    record: &MemoryRecord,
+    context_keywords: &[String],
+    weight: f64,
+) -> f64 {
     if context_keywords.is_empty() {
         return 0.0;
     }

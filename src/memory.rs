@@ -6,8 +6,11 @@ use uuid::Uuid;
 
 use crate::config::MemoryConfig;
 use crate::models::{effective_strength, retrieval_activation, run_consolidation_cycle};
+use crate::retrieval::{self, RetrievalConfig};
 use crate::storage::Storage;
-use crate::types::{LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, RecallResult, TypeStats};
+use crate::types::{
+    LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, RecallResult, TypeStats,
+};
 
 /// Main interface to the Engram memory system.
 ///
@@ -16,6 +19,7 @@ use crate::types::{LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryTyp
 pub struct Memory {
     storage: Storage,
     config: MemoryConfig,
+    retrieval_config: RetrievalConfig,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -25,9 +29,12 @@ impl Memory {
     /// # Arguments
     ///
     /// * `path` - Path to SQLite database file. Created if it doesn't exist.
-    ///           Use `:memory:` for in-memory (non-persistent) operation.
+    ///   Use `:memory:` for in-memory (non-persistent) operation.
     /// * `config` - MemoryConfig with tunable parameters. None = literature defaults.
-    pub fn new(path: &str, config: Option<MemoryConfig>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        path: &str,
+        config: Option<MemoryConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let storage = Storage::new(path)?;
         let config = config.unwrap_or_default();
         let created_at = Utc::now();
@@ -35,6 +42,7 @@ impl Memory {
         Ok(Self {
             storage,
             config,
+            retrieval_config: RetrievalConfig::default(),
             created_at,
         })
     }
@@ -60,6 +68,11 @@ impl Memory {
         source: Option<&str>,
         metadata: Option<serde_json::Value>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // Noise filter: skip low-value content like greetings and acknowledgments
+        if self.config.noise_filter_enabled && retrieval::is_noise(content) {
+            return Ok(String::new());
+        }
+
         let id = format!("{}", Uuid::new_v4())[..8].to_string();
         let importance = importance.unwrap_or_else(|| memory_type.default_importance());
 
@@ -109,44 +122,66 @@ impl Memory {
         context: Option<Vec<String>>,
         min_confidence: Option<f64>,
     ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
+        self.recall_hybrid(query, limit, context, min_confidence)
+    }
+
+    /// Set the retrieval pipeline configuration.
+    pub fn set_retrieval_config(&mut self, config: RetrievalConfig) {
+        self.retrieval_config = config;
+    }
+
+    /// Hybrid recall using the retrieval pipeline (RRF + MMR + cognitive scoring).
+    ///
+    /// Pre-computes ACT-R cognitive scores only for FTS candidates, then
+    /// feeds them into the retrieval pipeline for RRF fusion and MMR diversity.
+    fn recall_hybrid(
+        &mut self,
+        query: &str,
+        limit: usize,
+        context: Option<Vec<String>>,
+        min_confidence: Option<f64>,
+    ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
         let now = Utc::now();
         let context = context.unwrap_or_default();
         let min_conf = min_confidence.unwrap_or(0.0);
 
-        // Get candidate memories via FTS
-        let candidates = self.storage.search_fts(query, limit * 3)?;
+        // Pre-compute cognitive scores for FTS candidates
+        let pool_size = limit * self.retrieval_config.candidate_multiplier;
+        let fts_candidates = self.storage.search_fts(query, pool_size)?;
 
-        // Score each candidate with ACT-R activation
-        let mut scored: Vec<_> = candidates
+        let mut cognitive_scores: HashMap<String, f64> = HashMap::new();
+        for record in &fts_candidates {
+            let activation = retrieval_activation(
+                record,
+                &context,
+                now,
+                self.config.actr_decay,
+                self.config.context_weight,
+                self.config.importance_weight,
+                self.config.contradiction_penalty,
+            );
+            if activation > f64::NEG_INFINITY {
+                cognitive_scores.insert(record.id.clone(), activation);
+            }
+        }
+
+        // Run the retrieval pipeline (pass pre-fetched FTS results to avoid double query)
+        let scored_candidates = retrieval::retrieve(
+            fts_candidates,
+            limit,
+            &cognitive_scores,
+            &self.retrieval_config,
+        );
+
+        // Convert ScoredCandidates to RecallResults
+        let results: Vec<_> = scored_candidates
             .into_iter()
-            .map(|record| {
-                let activation = retrieval_activation(
-                    &record,
-                    &context,
-                    now,
-                    self.config.actr_decay,
-                    self.config.context_weight,
-                    self.config.importance_weight,
-                    self.config.contradiction_penalty,
-                );
-                (record, activation)
-            })
-            .filter(|(_, act)| *act > f64::NEG_INFINITY)
-            .collect();
-
-        // Sort by activation descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // Take top-k and compute confidence
-        let results: Vec<_> = scored
-            .into_iter()
-            .take(limit)
-            .map(|(record, activation)| {
-                let confidence = self.compute_confidence(&record, activation);
+            .map(|sc| {
+                let activation = cognitive_scores.get(&sc.record.id).copied().unwrap_or(0.0);
+                let confidence = self.compute_confidence(&sc.record, activation);
                 let confidence_label = confidence_label(confidence);
-
                 RecallResult {
-                    record,
+                    record: sc.record,
                     activation,
                     confidence,
                     confidence_label,
@@ -194,7 +229,8 @@ impl Memory {
 
         // Decay Hebbian links
         if self.config.hebbian_enabled {
-            self.storage.decay_hebbian_links(self.config.hebbian_decay)?;
+            self.storage
+                .decay_hebbian_links(self.config.hebbian_decay)?;
         }
 
         Ok(())
@@ -219,12 +255,13 @@ impl Memory {
             let now = Utc::now();
             let all = self.storage.all()?;
             for record in all {
-                if !record.pinned && effective_strength(&record, now) < threshold {
-                    if record.layer != MemoryLayer::Archive {
-                        let mut updated = record;
-                        updated.layer = MemoryLayer::Archive;
-                        self.storage.update(&updated)?;
-                    }
+                if !record.pinned
+                    && effective_strength(&record, now) < threshold
+                    && record.layer != MemoryLayer::Archive
+                {
+                    let mut updated = record;
+                    updated.layer = MemoryLayer::Archive;
+                    self.storage.update(&updated)?;
                 }
             }
         }
@@ -236,7 +273,11 @@ impl Memory {
     ///
     /// Detects positive/negative sentiment and applies reward modulation
     /// to recently accessed memories.
-    pub fn reward(&mut self, feedback: &str, recent_n: usize) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn reward(
+        &mut self,
+        feedback: &str,
+        recent_n: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let polarity = detect_feedback_polarity(feedback);
 
         if polarity == 0.0 {
@@ -321,7 +362,8 @@ impl Memory {
                     .map(|r| effective_strength(r, now))
                     .sum::<f64>()
                     / count as f64;
-                let avg_importance = records.iter().map(|r| r.importance).sum::<f64>() / count as f64;
+                let avg_importance =
+                    records.iter().map(|r| r.importance).sum::<f64>() / count as f64;
 
                 (
                     type_name,
@@ -338,7 +380,8 @@ impl Memory {
             .into_iter()
             .map(|(layer_name, records)| {
                 let count = records.len();
-                let avg_working = records.iter().map(|r| r.working_strength).sum::<f64>() / count as f64;
+                let avg_working =
+                    records.iter().map(|r| r.working_strength).sum::<f64>() / count as f64;
                 let avg_core = records.iter().map(|r| r.core_strength).sum::<f64>() / count as f64;
 
                 (
@@ -382,15 +425,18 @@ impl Memory {
     }
 
     /// Get Hebbian links for a specific memory.
-    pub fn hebbian_links(&self, memory_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub fn hebbian_links(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         Ok(self.storage.get_hebbian_neighbors(memory_id)?)
     }
 
     fn compute_confidence(&self, record: &MemoryRecord, activation: f64) -> f64 {
         // Simple confidence heuristic: normalize activation + importance
         let normalized_activation = (activation + 10.0) / 20.0; // Rough normalization
-        let confidence = (normalized_activation.max(0.0).min(1.0) * 0.7) + (record.importance * 0.3);
-        confidence.max(0.0).min(1.0)
+        let confidence = (normalized_activation.clamp(0.0, 1.0) * 0.7) + (record.importance * 0.3);
+        confidence.clamp(0.0, 1.0)
     }
 }
 
@@ -405,8 +451,25 @@ fn confidence_label(confidence: f64) -> String {
 
 fn detect_feedback_polarity(feedback: &str) -> f64 {
     let lower = feedback.to_lowercase();
-    let positive = ["good", "great", "excellent", "correct", "right", "yes", "nice", "perfect"];
-    let negative = ["bad", "wrong", "incorrect", "no", "error", "mistake", "poor"];
+    let positive = [
+        "good",
+        "great",
+        "excellent",
+        "correct",
+        "right",
+        "yes",
+        "nice",
+        "perfect",
+    ];
+    let negative = [
+        "bad",
+        "wrong",
+        "incorrect",
+        "no",
+        "error",
+        "mistake",
+        "poor",
+    ];
 
     let pos_count = positive.iter().filter(|&w| lower.contains(w)).count();
     let neg_count = negative.iter().filter(|&w| lower.contains(w)).count();
