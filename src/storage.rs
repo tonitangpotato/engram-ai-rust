@@ -310,6 +310,27 @@ impl Storage {
             "#,
         )?;
         
+        // Migrate old schema: add missing columns if table was created with only (memory_id, embedding)
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(memory_embeddings)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        
+        if !cols.contains(&"model".to_string()) {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE memory_embeddings ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown';
+                ALTER TABLE memory_embeddings ADD COLUMN dimensions INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE memory_embeddings ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
+                "#,
+            )?;
+            eprintln!("[engram] Migrated memory_embeddings: added model, dimensions, created_at columns");
+        }
+        
+        // Also fix: old schema had embedding as TEXT, new schema needs BLOB
+        // SQLite doesn't enforce column types strictly, so existing TEXT data works as-is
+        
         Ok(())
     }
 
