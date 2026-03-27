@@ -122,6 +122,9 @@ impl Storage {
         // Run migrations for embeddings
         Self::migrate_embeddings(&conn)?;
         
+        // Rebuild FTS with CJK tokenization if needed
+        Self::rebuild_fts_if_needed(&conn)?;
+        
         Ok(Self { conn })
     }
     
@@ -307,6 +310,58 @@ impl Storage {
             "#,
         )?;
         
+        Ok(())
+    }
+
+    /// Rebuild FTS index with CJK tokenization if not already done.
+    /// Uses engram_meta 'fts_cjk_version' to track migration state.
+    fn rebuild_fts_if_needed(conn: &Connection) -> SqlResult<()> {
+        const FTS_CJK_VERSION: &str = "1";
+        
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT value FROM engram_meta WHERE key = 'fts_cjk_version'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        
+        if current.as_deref() == Some(FTS_CJK_VERSION) {
+            return Ok(()); // Already up to date
+        }
+        
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+        if count == 0 {
+            conn.execute(
+                "INSERT OR REPLACE INTO engram_meta VALUES ('fts_cjk_version', ?1)",
+                params![FTS_CJK_VERSION],
+            )?;
+            return Ok(());
+        }
+        
+        // Rebuild: clear FTS and re-insert all with tokenization
+        conn.execute("DELETE FROM memories_fts", [])?;
+        
+        let mut stmt = conn.prepare("SELECT rowid, content FROM memories")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        
+        for (rowid, content) in &rows {
+            let tokenized = tokenize_cjk_boundaries(content);
+            conn.execute(
+                "INSERT INTO memories_fts(rowid, content) VALUES (?1, ?2)",
+                params![rowid, tokenized],
+            )?;
+        }
+        
+        conn.execute(
+            "INSERT OR REPLACE INTO engram_meta VALUES ('fts_cjk_version', ?1)",
+            params![FTS_CJK_VERSION],
+        )?;
+        
+        eprintln!("[engram] Rebuilt FTS index with CJK tokenization for {} memories", rows.len());
         Ok(())
     }
 
