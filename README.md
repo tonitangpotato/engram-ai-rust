@@ -13,7 +13,7 @@ Ebbinghaus forgetting, cognitive consolidation, vector embeddings, and LLM extra
 | ACT-R Activation | Retrieval based on frequency, recency, spreading activation |
 | Ollama Embeddings | Semantic similarity via local embeddings (nomic-embed-text) |
 | LLM Extraction | Extract key facts using Claude Haiku or local models |
-| EmotionBus | Emotional valence tracking, drive alignment, behavior feedback |
+| EmotionBus | Emotional valence tracking, drive alignment (multilingual), behavior feedback |
 | Session Working Memory | Miller's Law 7±2, topic continuity detection |
 | Confidence Calibration | Two-dimensional metacognitive monitoring |
 | Hybrid Search | Adaptive vector + FTS with configurable weights (15% FTS + 60% embedding + 25% ACT-R) |
@@ -28,7 +28,7 @@ Ebbinghaus forgetting, cognitive consolidation, vector embeddings, and LLM extra
 
 ```toml
 [dependencies]
-engramai = "0.2.0"
+engramai = "0.2.1"
 ```
 
 ### Basic Usage
@@ -188,23 +188,40 @@ For Chinese/Japanese/Korean text, Engram uses **jieba** for intelligent word seg
 ```
 User message
     ↓
-[Extractor] → LLM extracts key facts (optional)
+[Extractor] → LLM extracts key facts (Claude Haiku, optional)
     ↓
-[Embedding] → Generate vector (Ollama/OpenAI)
+[Embedding] → Generate 768-dim vector (Ollama nomic-embed-text, local)
     ↓
-[Storage] → SQLite (text + FTS + vector BLOB)
+[Drive Alignment] → Cosine similarity with pre-embedded SOUL drives (if EmotionBus active)
+    ↓                 → Importance boost for drive-aligned memories
+[Storage] → SQLite (text + FTS5 + vector BLOB + CJK tokenization)
     ↓
 
 Query
     ↓
-[Embedding] → Generate query vector
+[Embedding] → Generate query vector (same model)
     ↓
-[Hybrid Search] → Vector similarity + FTS + ACT-R activation
+[Hybrid Search] → 15% FTS + 60% embedding cosine + 25% ACT-R activation
     ↓
 [Confidence] → Two-dimensional scoring (reliability × salience)
     ↓
 Results with confidence labels
 ```
+
+### Embedding Model
+
+Engram uses **nomic-embed-text** via local Ollama by default:
+
+| Property | Value |
+|----------|-------|
+| Model | `nomic-embed-text` (Nomic AI, open source) |
+| Dimensions | 768 |
+| Runtime | Local Ollama (`localhost:11434`) |
+| Cost | Free (no API calls) |
+| Multilingual | Yes (sufficient for CJK ↔ Latin alignment) |
+| Latency | ~5ms per embedding |
+
+Configurable via `EmbeddingConfig` — swap to OpenAI `text-embedding-3-large` or any Ollama model without code changes.
 
 ### Cognitive Models
 
@@ -334,6 +351,48 @@ if let Some(bus) = mem.emotional_bus() {
 }
 ```
 
+### Cross-Language Drive Alignment
+
+Engram's EmotionalBus automatically handles multilingual SOUL drives using **embedding-based alignment**:
+
+```
+Problem: SOUL.md in Chinese, agent receives English messages
+  SOUL drive: "帮potato实现财务自由，找到市场机会"
+  Message: "trading profit market opportunity"
+  Keyword matching: score = 0.0 ❌ (字面不匹配)
+
+Solution: Hybrid alignment (keyword + embedding)
+  Keyword score: 0.0 (cross-language, can't match)
+  Embedding score: 0.14 (semantic similarity via nomic-embed-text)
+  Final score: max(0.0, 0.14) = 0.14 ✅
+```
+
+Drive descriptions are pre-embedded at startup. At store time, content embeddings (already computed for recall) are reused for alignment — **zero additional embedding cost**.
+
+```rust
+use engramai::Memory;
+
+let mut mem = Memory::with_emotional_bus("./agent.db", "./workspace", None)?;
+
+// If embedding provider is available, enable cross-language alignment
+if let (Some(bus), Some(provider)) = (mem.emotional_bus_mut(), mem.embedding_provider()) {
+    bus.init_embeddings(provider);
+    // Now Chinese drives align with English content (and vice versa)
+}
+
+// Importance boost works regardless of language
+let boost = bus.align_importance("trading profit today");  // > 1.0 if aligned
+let boost = bus.align_importance("今天交易赚了钱");           // > 1.0 if aligned
+let boost = bus.align_importance("nice weather outside");   // = 1.0 (not aligned)
+```
+
+**How it works:**
+- `nomic-embed-text` (768-dim) maps semantically similar content to nearby vectors regardless of language
+- `score_alignment_hybrid()` = `max(keyword_score, embedding_score)` — best of both worlds
+- Same-language: keyword matching wins (precise, score=1.0)
+- Cross-language: embedding matching wins (semantic, score=0.1-0.3)
+- Unrelated content: both return 0.0
+
 ## Memory Types
 
 | Type | Use case | Default importance |
@@ -405,22 +464,25 @@ let config = MemoryConfig::researcher();         // Minimal forgetting
 
 ## Python vs Rust
 
-| Feature | Python | Rust |
-|---------|--------|------|
-| ACT-R activation | ✅ | ✅ |
-| Hebbian learning | ✅ | ✅ |
-| Ebbinghaus forgetting | ✅ | ✅ |
-| Consolidation | ✅ | ✅ |
-| LLM Extraction | ❌ | ✅ |
-| Emotional Bus | ❌ | ✅ |
-| Multi-Agent / Namespace | ❌ | ✅ |
-| ACL | ❌ | ✅ |
-| Cross-Agent Subscriptions | ❌ | ✅ |
-| Vector embeddings | ✅ (50+ languages) | ✅ (Ollama) |
-| MCP server | ✅ | ⏳ planned |
-| Recall latency | ~10ms | **~1-5ms** |
-| Memory footprint | ~50MB | **~5MB** |
-| Deployment | Requires Python | **Single binary** |
+| Feature | Python 2.1 | TypeScript 2.1 | Rust 0.2.1 |
+|---------|------------|----------------|------------|
+| ACT-R activation | ✅ | ✅ | ✅ |
+| Hebbian learning | ✅ | ✅ | ✅ |
+| Ebbinghaus forgetting | ✅ | ✅ | ✅ |
+| Consolidation | ✅ | ✅ | ✅ |
+| Hybrid Search (FTS+Embed+ACT-R) | ✅ | ✅ | ✅ |
+| CJK Tokenization | ❌ | ❌ | ✅ (jieba) |
+| LLM Extraction | ❌ | ❌ | ✅ (Haiku) |
+| Emotional Bus | ❌ | ❌ | ✅ |
+| Cross-Language Alignment | ❌ | ❌ | ✅ (embedding) |
+| Multi-Agent / Namespace | ❌ | ❌ | ✅ |
+| ACL | ❌ | ❌ | ✅ |
+| Cross-Agent Subscriptions | ❌ | ❌ | ✅ |
+| Vector embeddings | ✅ (Ollama) | ✅ (Ollama) | ✅ (Ollama) |
+| MCP server | ✅ | ❌ | ⏳ planned |
+| Recall latency | ~10ms | ~8ms | **~1-5ms** |
+| Memory footprint | ~50MB | ~30MB | **~5MB** |
+| Deployment | Requires Python | Requires Node | **Single binary** |
 
 ## License
 
