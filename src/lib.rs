@@ -105,7 +105,7 @@ pub mod types;
 pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmotionalTrend, ActionStats, SubscriptionManager, Subscription, Notification, DriveEmbeddings, score_alignment_hybrid};
 pub use config::MemoryConfig;
 pub use embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
-pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, AnthropicExtractorConfig, OllamaExtractor, OllamaExtractorConfig};
+pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, AnthropicExtractorConfig, TokenProvider, OllamaExtractor, OllamaExtractorConfig};
 pub use memory::Memory;
 pub use storage::EmbeddingStats;
 pub use types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult};

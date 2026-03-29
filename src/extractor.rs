@@ -82,27 +82,50 @@ impl Default for AnthropicExtractorConfig {
 
 /// Extracts facts using Anthropic Claude API.
 ///
+/// Token provider trait for dynamic auth token resolution.
+///
+/// Implement this to provide tokens that auto-refresh (e.g., OAuth managed tokens).
+/// The extractor calls `get_token()` before each request, so expired tokens
+/// get refreshed transparently.
+pub trait TokenProvider: Send + Sync {
+    /// Get a valid auth token. May refresh if expired.
+    fn get_token(&self) -> Result<String, Box<dyn Error + Send + Sync>>;
+}
+
+/// Static token provider — wraps a fixed string. For backward compatibility.
+struct StaticToken(String);
+
+impl TokenProvider for StaticToken {
+    fn get_token(&self) -> Result<String, Box<dyn Error + Send + Sync>> {
+        Ok(self.0.clone())
+    }
+}
+
 /// Supports both OAuth tokens (Claude Max) and API keys.
 /// Haiku is recommended for cost/speed balance.
+///
+/// Auth tokens can be:
+/// - Static (fixed string, backward compatible)
+/// - Dynamic (via `TokenProvider` trait, auto-refreshes on each request)
 pub struct AnthropicExtractor {
     config: AnthropicExtractorConfig,
-    auth_token: String,
+    token_provider: Box<dyn TokenProvider>,
     is_oauth: bool,
     client: reqwest::blocking::Client,
 }
 
 impl AnthropicExtractor {
-    /// Create a new AnthropicExtractor with default config.
+    /// Create a new AnthropicExtractor with a static token.
     ///
     /// # Arguments
     ///
-    /// * `auth_token` - API key or OAuth token
+    /// * `auth_token` - API key or OAuth token (fixed string)
     /// * `is_oauth` - True if using OAuth token (Claude Max), false for API key
     pub fn new(auth_token: &str, is_oauth: bool) -> Self {
         Self::with_config(auth_token, is_oauth, AnthropicExtractorConfig::default())
     }
     
-    /// Create a new AnthropicExtractor with custom config.
+    /// Create with a static token and custom config.
     pub fn with_config(auth_token: &str, is_oauth: bool, config: AnthropicExtractorConfig) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
@@ -111,15 +134,38 @@ impl AnthropicExtractor {
         
         Self {
             config,
-            auth_token: auth_token.to_string(),
+            token_provider: Box::new(StaticToken(auth_token.to_string())),
+            is_oauth,
+            client,
+        }
+    }
+
+    /// Create with a dynamic token provider (auto-refreshes on each request).
+    ///
+    /// Use this for OAuth managed tokens that may expire and need refresh.
+    /// The provider's `get_token()` is called before each extraction request.
+    pub fn with_token_provider(
+        provider: Box<dyn TokenProvider>,
+        is_oauth: bool,
+        config: AnthropicExtractorConfig,
+    ) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .expect("failed to create HTTP client");
+        
+        Self {
+            config,
+            token_provider: provider,
             is_oauth,
             client,
         }
     }
     
     /// Build the request headers based on auth type.
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
+    fn build_headers(&self) -> Result<reqwest::header::HeaderMap, Box<dyn Error + Send + Sync>> {
         let mut headers = reqwest::header::HeaderMap::new();
+        let token = self.token_provider.get_token()?;
         
         headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
         headers.insert("content-type", "application/json".parse().unwrap());
@@ -132,7 +178,7 @@ impl AnthropicExtractor {
             );
             headers.insert(
                 reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", self.auth_token).parse().unwrap(),
+                format!("Bearer {}", token).parse().unwrap(),
             );
             headers.insert(
                 reqwest::header::USER_AGENT,
@@ -145,10 +191,10 @@ impl AnthropicExtractor {
             );
         } else {
             // API key mode
-            headers.insert("x-api-key", self.auth_token.parse().unwrap());
+            headers.insert("x-api-key", token.parse().unwrap());
         }
         
-        headers
+        Ok(headers)
     }
 }
 
@@ -171,7 +217,7 @@ impl MemoryExtractor for AnthropicExtractor {
         
         let response = self.client
             .post(&url)
-            .headers(self.build_headers())
+            .headers(self.build_headers()?)
             .json(&body)
             .send()?;
         
