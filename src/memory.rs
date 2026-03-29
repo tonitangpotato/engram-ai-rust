@@ -1540,6 +1540,11 @@ impl Memory {
     pub fn is_embedding_available(&self) -> bool {
         self.embedding.as_ref().map(|e| e.is_available()).unwrap_or(false)
     }
+
+    /// Get a reference to the embedding provider (if available).
+    pub fn embedding_provider(&self) -> Option<&EmbeddingProvider> {
+        self.embedding.as_ref()
+    }
     
     /// Check if embedding support is enabled (provider was created).
     pub fn has_embedding_support(&self) -> bool {

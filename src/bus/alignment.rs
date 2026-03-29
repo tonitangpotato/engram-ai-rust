@@ -1,11 +1,132 @@
 //! Drive Alignment Scorer — Score how well memories align with SOUL drives.
 //!
-//! Memories that align with core drives get automatic importance boosts.
+//! Two scoring strategies:
+//! - **Embedding-based** (preferred): Cosine similarity between content and drive embeddings.
+//!   Naturally handles multilingual content (Chinese SOUL + English content = still works).
+//! - **Keyword-based** (fallback): Simple keyword matching. Fast but monolingual.
 
 use crate::bus::mod_io::Drive;
+use crate::embeddings::EmbeddingProvider;
 
 /// Default importance multiplier for drive-aligned memories.
 pub const ALIGNMENT_BOOST: f64 = 1.5;
+
+/// Minimum cosine similarity to consider content "aligned" with a drive.
+/// With nomic-embed-text, cross-language baseline is ~0.1-0.3, so we need 
+/// a high enough threshold to filter noise while catching real alignment.
+const EMBEDDING_ALIGNMENT_THRESHOLD: f32 = 0.3;
+
+/// Pre-computed drive embeddings for fast alignment scoring.
+#[derive(Clone)]
+pub struct DriveEmbeddings {
+    /// (drive_index, embedding_vector) pairs
+    pub(crate) entries: Vec<(usize, Vec<f32>)>,
+}
+
+impl DriveEmbeddings {
+    /// Number of drives with embeddings.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no drives have embeddings.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Pre-compute embeddings for all drives.
+    /// Returns None if embedding provider is unavailable.
+    pub fn compute(drives: &[Drive], provider: &EmbeddingProvider) -> Option<Self> {
+        if drives.is_empty() || !provider.is_available() {
+            return None;
+        }
+
+        let mut entries = Vec::new();
+        for (i, drive) in drives.iter().enumerate() {
+            // Embed the drive description + name for rich semantic representation
+            let text = format!("{}: {}", drive.name, drive.description);
+            match provider.embed(&text) {
+                Ok(vec) => entries.push((i, vec)),
+                Err(e) => {
+                    log::debug!("Failed to embed drive '{}': {}", drive.name, e);
+                    // Continue with other drives
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            None
+        } else {
+            Some(Self { entries })
+        }
+    }
+
+    /// Score alignment using cosine similarity between content embedding and drive embeddings.
+    /// Returns 0.0-1.0 alignment score.
+    pub fn score(&self, content_embedding: &[f32]) -> f64 {
+        if self.entries.is_empty() {
+            return 0.0;
+        }
+
+        let mut max_similarity: f32 = 0.0;
+        let mut total_similarity: f32 = 0.0;
+        let mut aligned_count = 0;
+
+        for (_idx, drive_emb) in &self.entries {
+            let sim = EmbeddingProvider::cosine_similarity(content_embedding, drive_emb);
+            if sim > EMBEDDING_ALIGNMENT_THRESHOLD {
+                aligned_count += 1;
+                total_similarity += sim;
+            }
+            if sim > max_similarity {
+                max_similarity = sim;
+            }
+        }
+
+        if aligned_count == 0 {
+            return 0.0;
+        }
+
+        // Use average of aligned similarities, normalized to 0.0-1.0
+        let avg = total_similarity / aligned_count as f32;
+        // Map from [threshold..1.0] to [0.0..1.0]
+        let normalized = ((avg - EMBEDDING_ALIGNMENT_THRESHOLD) / (1.0 - EMBEDDING_ALIGNMENT_THRESHOLD)).min(1.0);
+        normalized as f64
+    }
+
+    /// Find which drives align with content, returning (drive_index, similarity).
+    pub fn find_aligned(&self, content_embedding: &[f32]) -> Vec<(usize, f32)> {
+        self.entries.iter()
+            .map(|(idx, drive_emb)| (*idx, EmbeddingProvider::cosine_similarity(content_embedding, drive_emb)))
+            .filter(|(_, sim)| *sim > EMBEDDING_ALIGNMENT_THRESHOLD)
+            .collect()
+    }
+}
+
+/// Score alignment using combined embedding + keyword signals.
+///
+/// Strategy:
+/// - If both embedding and keyword signals exist, combine them (max wins)
+/// - If only embedding, use embedding score
+/// - If only keyword, use keyword score
+/// - This naturally handles multilingual: embedding catches cross-language,
+///   keywords catch same-language exact matches
+pub fn score_alignment_hybrid(
+    content: &str,
+    drives: &[Drive],
+    drive_embeddings: Option<&DriveEmbeddings>,
+    content_embedding: Option<&[f32]>,
+) -> f64 {
+    let keyword_score = score_alignment(content, drives);
+    
+    let embedding_score = match (drive_embeddings, content_embedding) {
+        (Some(de), Some(ce)) => de.score(ce),
+        _ => 0.0,
+    };
+
+    // Take the max — either signal is sufficient
+    keyword_score.max(embedding_score)
+}
 
 /// Score how well a memory content aligns with a set of drives.
 ///
@@ -208,5 +329,111 @@ mod tests {
         let content = "any content here";
         assert_eq!(score_alignment(content, &drives), 0.0);
         assert_eq!(calculate_importance_boost(content, &drives), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod embedding_tests {
+    use super::*;
+
+    #[test]
+    fn test_embedding_alignment_if_available() {
+        // Only runs meaningfully with Ollama available
+        let provider = EmbeddingProvider::new(crate::embeddings::EmbeddingConfig::ollama("nomic-embed-text", 768));
+        
+        if !provider.is_available() {
+            println!("⚠️ Ollama not available, skipping embedding alignment test");
+            return;
+        }
+
+        // Create drives with Chinese descriptions (simulating SOUL.md parse)
+        let drives = vec![
+            crate::bus::mod_io::Drive {
+                name: "财务自由".to_string(),
+                description: "帮potato实现财务自由，找到市场机会，交易获利".to_string(),
+                keywords: vec!["财务自由".into(), "市场机会".into(), "交易获利".into()],
+            },
+            crate::bus::mod_io::Drive {
+                name: "技术深度".to_string(),
+                description: "写优秀的代码，深入理解Rust和系统架构".to_string(),
+                keywords: vec!["代码".into(), "rust".into(), "架构".into()],
+            },
+        ];
+
+        // Pre-compute drive embeddings
+        let de = DriveEmbeddings::compute(&drives, &provider);
+        assert!(de.is_some(), "Should compute drive embeddings");
+        let de = de.unwrap();
+        assert_eq!(de.len(), 2);
+
+        // Test 1: English "trading profit" should align with Chinese "交易获利" drive
+        let english_trading = provider.embed("trading profit market opportunity revenue").unwrap();
+        let trading_score = de.score(&english_trading);
+        println!("English 'trading profit' → Chinese '财务自由' drive: score={:.3}", trading_score);
+        
+        // Test 2: English "rust code architecture" should align with Chinese "技术深度" drive  
+        let english_coding = provider.embed("rust code architecture system design").unwrap();
+        let coding_score = de.score(&english_coding);
+        println!("English 'rust code' → Chinese '技术深度' drive: score={:.3}", coding_score);
+
+        // Test 3: Unrelated content should NOT align
+        let unrelated = provider.embed("weather forecast sunny tomorrow beach vacation").unwrap();
+        let unrelated_score = de.score(&unrelated);
+        println!("English 'weather beach' → drives: score={:.3}", unrelated_score);
+
+        // Verify: trading and coding should score higher than unrelated
+        assert!(trading_score > unrelated_score, 
+            "Trading ({:.3}) should score higher than unrelated ({:.3})", trading_score, unrelated_score);
+        assert!(coding_score > unrelated_score,
+            "Coding ({:.3}) should score higher than unrelated ({:.3})", coding_score, unrelated_score);
+
+        // Test 4: Chinese content should also work
+        let chinese_trading = provider.embed("交易策略今天赚了50美元").unwrap();
+        let zh_score = de.score(&chinese_trading);
+        println!("Chinese '交易策略赚了50美元' → drives: score={:.3}", zh_score);
+
+        // Test hybrid function: English content + Chinese drives
+        let hybrid_en = score_alignment_hybrid(
+            "trading profit revenue",
+            &drives,
+            Some(&de),
+            Some(&english_trading),
+        );
+        println!("Hybrid (English→Chinese drives): {:.3}", hybrid_en);
+        // Keyword alone returns 0 for cross-language, embedding provides signal
+        assert!(hybrid_en > 0.0, "Hybrid should find cross-language alignment");
+
+        // Test hybrid: Chinese content + Chinese drives (both signals)
+        let hybrid_zh = score_alignment_hybrid(
+            "交易策略今天赚了50美元 市场机会",
+            &drives,
+            Some(&de),
+            Some(&chinese_trading),
+        );
+        println!("Hybrid (Chinese→Chinese drives): {:.3}", hybrid_zh);
+        // Both keyword AND embedding should contribute
+        assert!(hybrid_zh > 0.0, "Chinese-Chinese should have strong alignment");
+
+        // Test: keyword-only fallback still works for same-language
+        let keyword_only = score_alignment_hybrid(
+            "市场机会 交易获利 财务自由",
+            &drives,
+            None,
+            None,
+        );
+        println!("Keyword-only (Chinese→Chinese): {:.3}", keyword_only);
+        assert!(keyword_only > 0.0, "Same-language keywords should match");
+
+        // Test: keyword-only fails cross-language (this is the bug we're fixing)
+        let keyword_cross = score_alignment_hybrid(
+            "trading profit revenue",
+            &drives,
+            None,
+            None,
+        );
+        println!("Keyword-only (English→Chinese): {:.3}", keyword_cross);
+        assert_eq!(keyword_cross, 0.0, "Keywords alone can't match cross-language");
+
+        println!("\n🎉 Embedding alignment solves cross-language: English→Chinese works!");
     }
 }

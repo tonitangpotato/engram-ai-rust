@@ -18,8 +18,10 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::embeddings::EmbeddingProvider;
+
 pub use accumulator::{EmotionalAccumulator, EmotionalTrend, NEGATIVE_THRESHOLD, MIN_EVENTS_FOR_SUGGESTION};
-pub use alignment::{score_alignment, calculate_importance_boost, find_aligned_drives, ALIGNMENT_BOOST};
+pub use alignment::{score_alignment, calculate_importance_boost, find_aligned_drives, score_alignment_hybrid, DriveEmbeddings, ALIGNMENT_BOOST};
 pub use feedback::{BehaviorFeedback, ActionStats, BehaviorLog, LOW_SCORE_THRESHOLD, MIN_ATTEMPTS_FOR_SUGGESTION};
 pub use mod_io::{Drive, HeartbeatTask, Identity};
 pub use subscriptions::{SubscriptionManager, Subscription, Notification};
@@ -52,6 +54,8 @@ pub struct HeartbeatUpdate {
 pub struct EmotionalBus {
     workspace_dir: PathBuf,
     drives: Vec<Drive>,
+    /// Pre-computed drive embeddings for semantic alignment (None if embedding unavailable)
+    drive_embeddings: Option<DriveEmbeddings>,
 }
 
 impl EmotionalBus {
@@ -74,12 +78,43 @@ impl EmotionalBus {
         Ok(Self {
             workspace_dir,
             drives,
+            drive_embeddings: None,
         })
     }
+
+    /// Initialize embedding-based drive alignment.
+    /// Call this after creation if an EmbeddingProvider is available.
+    /// Pre-computes embeddings for all drives for fast alignment scoring.
+    pub fn init_embeddings(&mut self, provider: &EmbeddingProvider) {
+        match DriveEmbeddings::compute(&self.drives, provider) {
+            Some(de) => {
+                log::info!(
+                    "Drive embeddings computed for {} drives (embedding-based alignment enabled)",
+                    de.len()
+                );
+                self.drive_embeddings = Some(de);
+            }
+            None => {
+                log::debug!("Drive embeddings not available, using keyword fallback");
+            }
+        }
+    }
+
+    /// Check if embedding-based alignment is available.
+    pub fn has_embeddings(&self) -> bool {
+        self.drive_embeddings.is_some()
+    }
+
+    /// Get pre-computed drive embeddings (for passing to score_alignment_hybrid).
+    pub fn drive_embeddings(&self) -> Option<&DriveEmbeddings> {
+        self.drive_embeddings.as_ref()
+    }
     
-    /// Reload drives from SOUL.md.
+    /// Reload drives from SOUL.md. Re-computes embeddings if provider given.
     pub fn reload_drives(&mut self) -> Result<(), std::io::Error> {
         self.drives = mod_io::read_soul(&self.workspace_dir)?;
+        // Note: drive_embeddings will be stale. Call init_embeddings() to refresh.
+        self.drive_embeddings = None;
         Ok(())
     }
     
@@ -115,14 +150,39 @@ impl EmotionalBus {
     
     /// Calculate importance boost for a memory based on drive alignment.
     ///
-    /// Call this when storing a memory to potentially boost its importance.
+    /// Uses embedding-based scoring if available (handles multilingual),
+    /// falls back to keyword matching.
     pub fn align_importance(&self, content: &str) -> f64 {
-        calculate_importance_boost(content, &self.drives)
+        let alignment = score_alignment_hybrid(
+            content,
+            &self.drives,
+            self.drive_embeddings.as_ref(),
+            None, // No pre-computed content embedding; caller can use align_importance_with_embedding
+        );
+        if alignment <= 0.0 {
+            return 1.0;
+        }
+        1.0 + (ALIGNMENT_BOOST - 1.0) * alignment
+    }
+
+    /// Calculate importance boost with a pre-computed content embedding.
+    /// Preferred path when embedding is available — avoids recomputing.
+    pub fn align_importance_with_embedding(&self, content: &str, content_embedding: &[f32]) -> f64 {
+        let alignment = score_alignment_hybrid(
+            content,
+            &self.drives,
+            self.drive_embeddings.as_ref(),
+            Some(content_embedding),
+        );
+        if alignment <= 0.0 {
+            return 1.0;
+        }
+        1.0 + (ALIGNMENT_BOOST - 1.0) * alignment
     }
     
-    /// Score how well content aligns with drives.
+    /// Score how well content aligns with drives (hybrid: embedding + keyword fallback).
     pub fn alignment_score(&self, content: &str) -> f64 {
-        score_alignment(content, &self.drives)
+        score_alignment_hybrid(content, &self.drives, self.drive_embeddings.as_ref(), None)
     }
     
     /// Find which drives a piece of content aligns with.

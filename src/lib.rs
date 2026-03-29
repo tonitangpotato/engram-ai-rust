@@ -102,7 +102,7 @@ pub mod storage;
 pub mod types;
 
 // Re-export main types
-pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmotionalTrend, ActionStats, SubscriptionManager, Subscription, Notification};
+pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmotionalTrend, ActionStats, SubscriptionManager, Subscription, Notification, DriveEmbeddings, score_alignment_hybrid};
 pub use config::MemoryConfig;
 pub use embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
 pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, AnthropicExtractorConfig, OllamaExtractor, OllamaExtractorConfig};
